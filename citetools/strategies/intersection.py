@@ -1,18 +1,27 @@
 import networkx as nx
 from typing import Optional
+from joblib import Parallel
 
 
 def _grow_groups(
     oracle,
     groups: list[list[str]],
-    depth: int
+    depth: int,
+    parallel
 ) -> tuple[list[nx.DiGraph], list[set[str]]]:
     """
-    For each group of seed ids, expand every seed via oracle.grow(seed, depth).
+    For each group of seed ids, expand every seed via oracle.grow(seed, depth)
+    using concurrent worker threads if parallel is bound, or serially if None.
     Precondition: read g.graph["seed"] from each per-seed graph BEFORE composing,
     because nx.compose merges .graph dicts and only the last would survive.
     Returns (group_graphs, seed_ids_per_group) where each group graph is a composed
     DiGraph and seed_ids_per_group is the canonical seed W-ids for each group.
+
+    Args:
+        oracle: CiteGraph instance with a grow(seed, depth, parallel=...) method.
+        groups: list of lists of seed ids.
+        depth: citation hops to expand each seed.
+        parallel: bound joblib.Parallel object (threading backend) or None for serial.
 
     Pseudocode:
       group_graphs = []
@@ -21,7 +30,7 @@ def _grow_groups(
         gg = empty DiGraph
         canonical_seed_ids = set()
         for seed in seeds:
-          sub_graph = oracle.grow(seed, depth)
+          sub_graph = oracle.grow(seed, depth, parallel=parallel)
           canonical_id = sub_graph.graph["seed"]
           canonical_seed_ids.add(canonical_id)
           gg = compose(gg, sub_graph)
@@ -40,7 +49,7 @@ def _grow_groups(
         canonical_seed_ids = set()
 
         for seed in seeds:
-            sub_graph = oracle.grow(seed, depth)
+            sub_graph = oracle.grow(seed, depth, parallel=parallel)
             canonical_id = sub_graph.graph["seed"]
             canonical_seed_ids.add(canonical_id)
             gg = nx.compose(gg, sub_graph)
@@ -146,9 +155,9 @@ def _score(
                 "degree": degree
             })
 
-    # sort by groups_hit desc, score asc, cited_by_count desc
+    # sort by groups_hit desc, score asc, cited_by_count desc, then by id for determinism
     candidates.sort(key=lambda r: (-r["groups_hit"], r["score"],
-                                   -(r.get("cited_by_count") or 0)))
+                                   -(r.get("cited_by_count") or 0), r["id"]))
     return candidates[:top_k]
 
 
@@ -157,6 +166,7 @@ def find_bridges(
     groups: list[list[str]],
     *,
     depth: int = 2,
+    n_jobs: int = 8,
     min_groups: Optional[int] = None,
     top_k: int = 25
 ) -> list[dict]:
@@ -164,11 +174,14 @@ def find_bridges(
     N-way intersection strategy: find papers that bridge multiple research groups.
 
     Args:
-        oracle: CiteGraph instance; exposes grow(seed, depth) -> DiGraph with
-                g.graph["seed"] set and nodes carrying title, year, cited_by_count, doi.
+        oracle: CiteGraph instance; exposes grow(seed, depth, parallel=...) -> DiGraph
+                with g.graph["seed"] set and nodes carrying title, year,
+                cited_by_count, doi.
         groups: list of lists; each inner list is the seed paper ids (W-ids, DOIs, or
                 OpenAlex URLs) for one research group. Each group must be non-empty.
         depth: citation hops to expand each seed. Default 2.
+        n_jobs: number of worker threads for concurrent neighbour fetching. Default 8.
+                Set to 1 for serial (no-pool) execution.
         min_groups: require a candidate be reachable from at least this many groups.
                     Defaults to len(groups) (true N-way intersection). Relax to
                     len(groups) - 1 to include papers in the "almost intersection" tier.
@@ -193,9 +206,10 @@ def find_bridges(
     Procedure:
       1. validate all groups are non-empty; raise ValueError if any is.
       2. default min_groups to len(groups) if not provided.
-      3. expand each group via _grow_groups.
-      4. score and rank candidates via _score.
-      5. return the ranked list (already sorted and trimmed to top_k).
+      3. expand each group within a joblib thread pool via _grow_groups.
+      4. score and rank candidates via _score (pure-CPU, runs after pool closes).
+      5. ensure oracle.client.close() is called to release per-thread HTTP sessions.
+      6. return the ranked list (already sorted and trimmed to top_k).
     """
     # validate all groups are non-empty
     for g in groups:
@@ -206,11 +220,13 @@ def find_bridges(
     if min_groups is None:
         min_groups = len(groups)
 
-    # expand each group
-    group_graphs, seed_ids_per_group = _grow_groups(oracle, groups, depth)
-
-    # score and rank candidates
-    return _score(group_graphs, seed_ids_per_group, min_groups, top_k)
+    # expand each group within a joblib thread pool; close client after
+    try:
+        with Parallel(n_jobs=n_jobs, backend="threading") as parallel:
+            group_graphs, seed_ids_per_group = _grow_groups(oracle, groups, depth, parallel)
+        return _score(group_graphs, seed_ids_per_group, min_groups, top_k)
+    finally:
+        oracle.client.close()
 
 
 __all__ = ["find_bridges"]

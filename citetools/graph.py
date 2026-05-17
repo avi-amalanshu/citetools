@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Callable, Literal
 import networkx as nx
+from .parallel import fetch_all
 
 
 def _rank_cited_by_count(work: dict) -> float:
@@ -110,6 +111,13 @@ class CiteGraph:
         Returns:
           dict with keys "refs" and "citers", each a list of canonical W-ids.
           unknown node -> {"refs": [], "citers": []}
+
+        Thread-safety note:
+          No locking required. fetch_all passes only distinct nodes within a hop
+          (frontier is a set), and seeds/hops run sequentially (each grow call is serial
+          across hops). Thus, no two threads call nbrs(same_node) concurrently.
+          Cache writes are per-distinct-key only; CPython per-key dict writes are
+          GIL-atomic.
         """
         if node in self._nbrs_cache:
             return self._nbrs_cache[node]
@@ -134,7 +142,7 @@ class CiteGraph:
 
         return result
 
-    def grow(self, seed: str, depth: int) -> nx.DiGraph:
+    def grow(self, seed: str, depth: int, *, parallel=None) -> nx.DiGraph:
         """
         BFS from seed out to depth hops over nbrs.
 
@@ -197,6 +205,8 @@ class CiteGraph:
         Args:
           seed: any id form (W-id, DOI, URL); client.key normalizes
           depth: int >= 0, number of hops
+          parallel: None (serial) or a bound joblib.Parallel object (concurrent).
+            default None; if None, uses serial _nbrs_cache fetches.
 
         Returns:
           nx.DiGraph with:
@@ -221,9 +231,19 @@ class CiteGraph:
         for _ in range(depth):
             new_frontier_sources: dict[str, str] = {}  # {node_id: "refs"|"citers"|"both"}
 
-            for node in frontier - visited:
+            # phase A: compute sorted frontier and fetch all neighbors concurrently
+            to_expand = sorted(frontier - visited)
+            fetched = fetch_all(self, to_expand, parallel)
+
+            # phase B: add edges and book-keep new frontier sources
+            for node in to_expand:
                 visited.add(node)
-                nbrs_dict = self.nbrs(node)
+                nb = fetched[node]
+                # treat Exception as unknown node (empty neighbors)
+                if isinstance(nb, Exception):
+                    nbrs_dict = {"refs": [], "citers": []}
+                else:
+                    nbrs_dict = nb
 
                 # refs (outgoing edges): node -> ref_id
                 for ref_id in nbrs_dict["refs"]:
@@ -312,12 +332,15 @@ class CiteGraph:
               * retrieve metadata from _meta_cache; if not present, use empty dict
               * score = cap_key(metadata)
               * append (score, node, edge_type) to scored list
-          - sort scored list descending by score (highest first)
+          - stable two-pass sort for total order:
+              * sort by node (W-id) ascending
+              * then sort by score descending (stable, preserves node order within ties)
           - filter by cap_dir:
               * if cap_dir == "both": keep all
               * else: keep only tuples where edge_type matches cap_dir or is "both"
           - take top-cap by position (or all if fewer than cap)
           - return as set of node ids
+          result: nodes ranked by score (desc), with ties broken by W-id ascending
 
         Args:
           candidates: dict {node_id: edge_source_type}
@@ -337,8 +360,10 @@ class CiteGraph:
             score = self.cap_key(work)
             scored.append((score, node, edge_type))
 
-        # sort descending by score
-        scored.sort(reverse=True, key=lambda x: x[0])
+        # stable two-pass sort: first by node id (ascending), then by score (descending)
+        # preserves node-id order within equal scores, providing total order
+        scored.sort(key=lambda x: x[1])  # node ascending
+        scored.sort(reverse=True, key=lambda x: x[0])  # score descending (stable)
 
         # filter by cap_dir
         if self.cap_dir == "both":

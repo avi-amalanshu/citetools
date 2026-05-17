@@ -1,6 +1,7 @@
 """OpenAlex HTTP client with polite-pool retry and dual caching."""
 
 import re
+import threading
 import time
 from collections.abc import Iterable
 from typing import Any
@@ -14,13 +15,55 @@ from .errors import BadId, OpenAlexError
 OPENALEX_BASE = "https://api.openalex.org"
 
 
-class OpenAlex:
-	"""HTTP client for OpenAlex API with polite-pool settings.
+class _RateLimiter:
+	"""Shared rate-limiter for concurrent threads: caps aggregate request rate at 1/interval req/s.
 
-	Builds a requests.Session with urllib3 Retry (429 + 5xx, honours Retry-After).
+	acquire() reserves a thread's slot under a lock (O(1) per-thread), then sleeps outside the
+	lock. N threads thus reserve staggered slots and reach throughput N threads concurrently
+	requesting, with aggregate rate exactly 1/interval req/s, without serializing to 1 req/s.
+	"""
+
+	def __init__(self, interval: float) -> None:
+		"""Store interval and initialize lock and next-slot timestamp.
+
+		interval: seconds between requests (e.g. 0.1 -> 10 req/s aggregate).
+		"""
+		self.interval = interval
+		self._lock = threading.Lock()
+		self._next = 0.0
+
+	def acquire(self) -> None:
+		"""Reserve this thread's slot and sleep appropriately.
+
+		Under lock: read current time, compute the slot time max(now, self._next),
+		reserve it by setting self._next = slot + interval, then release lock.
+		Outside lock: sleep for (slot - now) if positive. This allows N threads to
+		reserve staggered slots concurrently without holding the lock during sleep.
+		"""
+		with self._lock:
+			now = time.monotonic()
+			start = max(now, self._next)
+			self._next = start + self.interval
+
+		wait = start - now
+		if wait > 0:
+			time.sleep(wait)
+
+
+class OpenAlex:
+	"""HTTP client for OpenAlex API with thread-safe concurrent requests and rate limiting.
+
+	Each thread gets its own requests.Session via threading.local(), initialized lazily
+	on first _session() call and registered for cleanup. A shared _RateLimiter caps
+	aggregate request rate at 1/sleep req/s across all threads without serializing.
+
 	Caches full works in _cache (keyed by canonical W-id); trimmed metadata in _meta.
-	session param allows test mocking; if None, creates fresh Session.
-	Not thread-safe; caller serializes access.
+	Both caches are shared plain dicts, safe under concurrent fetches because callers
+	only ever write to distinct keys (CPython per-key dict writes are GIL-atomic).
+
+	session param allows test mocking; if provided, used as single shared session.
+	Call close() to release all sessions. clear() is not safe to call concurrently
+	with work/works/citers.
 	"""
 
 	def __init__(
@@ -32,42 +75,75 @@ class OpenAlex:
 		citer_k: int = 50,
 		session: requests.Session | None = None,
 	) -> None:
-		"""Initialize OpenAlex client with polite-pool settings.
+		"""Initialize OpenAlex client with polite-pool settings and thread-safe concurrency.
 
 		mailto: email address for User-Agent and polite-pool qualification.
-		sleep: delay after each successful HTTP response (seconds).
+		sleep: delay after each successful HTTP response (seconds); also caps aggregate request rate.
 		timeout: request timeout (seconds).
 		citer_k: default page size for citers() calls.
-		session: optional requests.Session for test injection; if None, creates fresh one.
+		session: optional requests.Session for test injection; if None, uses thread-local sessions.
 		"""
 		self.mailto = mailto
 		self.sleep = sleep
 		self.timeout = timeout
 		self.citer_k = citer_k
 
-		if session is None:
-			self.session = requests.Session()
+		# rate limiter shared across all threads
+		self._limiter = _RateLimiter(self.sleep)
+
+		# session management
+		if session is not None:
+			# test path: single injected session
+			self._injected_session = session
+			session.headers["User-Agent"] = f"citetools/1.0 ({mailto})"
 		else:
-			self.session = session
-
-		self.session.headers["User-Agent"] = f"citetools/1.0 ({mailto})"
-
-		# configure retry on both schemes
-		retry = Retry(
-			total=5,
-			backoff_factor=1.0,
-			status_forcelist=[429, 500, 502, 503, 504],
-			respect_retry_after_header=True,
-		)
-		adapter = HTTPAdapter(max_retries=retry)
-		self.session.mount("http://", adapter)
-		self.session.mount("https://", adapter)
+			# production path: thread-local sessions
+			self._injected_session = None
+			self._local = threading.local()
+			self._sessions: list = []
+			self._sessions_lock = threading.Lock()
 
 		# dual caches: both empty dicts
 		self._cache: dict[str, dict[str, Any]] = {}
 		self._meta: dict[str, dict[str, Any]] = {}
 
 		self.params = {"mailto": mailto}
+
+	def _session(self) -> requests.Session:
+		"""Return the session for the current thread.
+
+		Test path: if session was injected, return it directly (shared across threads).
+		Production path: lazily build per-thread session from self._local, mount Retry
+		adapter with identical settings (total=5, backoff_factor=1.0, status_forcelist
+		=[429,500,502,503,504], respect_retry_after_header=True), set User-Agent header,
+		and register it in self._sessions for cleanup on close().
+		"""
+		if self._injected_session is not None:
+			return self._injected_session
+
+		# thread-local production path
+		if not hasattr(self._local, "session"):
+			s = requests.Session()
+			s.headers["User-Agent"] = f"citetools/1.0 ({self.mailto})"
+
+			# configure retry on both schemes
+			retry = Retry(
+				total=5,
+				backoff_factor=1.0,
+				status_forcelist=[429, 500, 502, 503, 504],
+				respect_retry_after_header=True,
+			)
+			adapter = HTTPAdapter(max_retries=retry)
+			s.mount("http://", adapter)
+			s.mount("https://", adapter)
+
+			self._local.session = s
+
+			# register in global list for close()
+			with self._sessions_lock:
+				self._sessions.append(s)
+
+		return self._local.session
 
 	@staticmethod
 	def key(pid: str) -> str:
@@ -110,7 +186,7 @@ class OpenAlex:
 
 		pid -> key (normalized) -> HTTP GET /works/{key} -> extract canonical_wid
 		  from response["id"] -> cache full object in _cache[canonical_wid] and
-		  _cache[key]; also in _meta. sleep, return data.
+		  _cache[key]; also in _meta. rate-limit, return data.
 		raises BadId (from key), OpenAlexError (HTTP failures).
 		"""
 		lookup_key = self.key(pid)
@@ -119,10 +195,13 @@ class OpenAlex:
 		if lookup_key in self._cache:
 			return self._cache[lookup_key]
 
+		# rate-limit before HTTP
+		self._limiter.acquire()
+
 		# fetch
 		url = f"{OPENALEX_BASE}/works/{lookup_key}"
 		try:
-			response = self.session.get(url, params=self.params, timeout=self.timeout)
+			response = self._session().get(url, params=self.params, timeout=self.timeout)
 			response.raise_for_status()
 			data = response.json()
 		except requests.RequestException as e:
@@ -136,7 +215,6 @@ class OpenAlex:
 		self._cache[lookup_key] = data
 		self._meta[canonical_wid] = data
 
-		time.sleep(self.sleep)
 		return data
 
 	def works(self, pids: Iterable[str]) -> dict[str, dict[str, Any]]:
@@ -161,7 +239,6 @@ class OpenAlex:
 		for pid in pids_list:
 			lookup_key = self.key(pid)
 			if lookup_key in self._cache:
-				canonical_wid = lookup_key if lookup_key.startswith("W") else lookup_key
 				# extract canonical from cached data
 				cached_data = self._cache[lookup_key]
 				canonical_wid = cached_data["id"].rsplit("/", 1)[-1].upper()
@@ -177,8 +254,11 @@ class OpenAlex:
 			chunk = w_ids_to_fetch[i : i + 50]
 			filter_str = "openalex:" + "|".join(chunk)
 
+			# rate-limit before HTTP
+			self._limiter.acquire()
+
 			try:
-				response = self.session.get(
+				response = self._session().get(
 					f"{OPENALEX_BASE}/works",
 					params={**self.params, "filter": filter_str, "per-page": 50},
 					timeout=self.timeout,
@@ -194,8 +274,6 @@ class OpenAlex:
 				self._cache[canonical_wid] = w
 				self._meta[canonical_wid] = w
 				out[canonical_wid] = w
-
-			time.sleep(self.sleep)
 
 		return out
 
@@ -215,6 +293,9 @@ class OpenAlex:
 		seed_work = self.work(pid)
 		canonical_wid = seed_work["id"].rsplit("/", 1)[-1].upper()
 
+		# rate-limit before HTTP
+		self._limiter.acquire()
+
 		# fetch citers
 		try:
 			params = {
@@ -224,7 +305,7 @@ class OpenAlex:
 				"per-page": k,
 				"select": "id,title,publication_year,cited_by_count,doi",
 			}
-			response = self.session.get(
+			response = self._session().get(
 				f"{OPENALEX_BASE}/works",
 				params=params,
 				timeout=self.timeout,
@@ -243,7 +324,6 @@ class OpenAlex:
 			self._meta[w_id] = w
 			out.append(w_id)
 
-		time.sleep(self.sleep)
 		return out
 
 	def clear(self) -> None:
@@ -254,3 +334,17 @@ class OpenAlex:
 		"""
 		self._cache.clear()
 		self._meta.clear()
+
+	def close(self) -> None:
+		"""Close all managed sessions.
+
+		Test path: if session was injected, close it. Production path: close all
+		thread-local sessions registered in self._sessions. Idempotent (safe to
+		call multiple times).
+		"""
+		if self._injected_session is not None:
+			self._injected_session.close()
+		else:
+			with self._sessions_lock:
+				for s in self._sessions:
+					s.close()

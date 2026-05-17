@@ -57,6 +57,12 @@ def main() -> None:
         help="minimum group count for a candidate to qualify (default: number of groups passed)",
     )
     parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=8,
+        help="worker threads for concurrent OpenAlex fetching (default 8; 1 = serial)",
+    )
+    parser.add_argument(
         "--group",
         type=str,
         action="append",
@@ -72,6 +78,10 @@ def main() -> None:
     # validate top-k
     if args.top_k < 1:
         raise ValueError("top-k must be >= 1")
+
+    # validate n-jobs
+    if args.n_jobs < 1:
+        raise ValueError("n-jobs must be >= 1")
 
     # handle groups: parse or use demo
     if args.group is None:
@@ -106,6 +116,7 @@ def main() -> None:
         depth=args.depth,
         min_groups=min_groups,
         top_k=args.top_k,
+        n_jobs=args.n_jobs,
     )
 
     # print header
@@ -113,10 +124,10 @@ def main() -> None:
         f"""\
         Citation bridge finder (citetools)
         ==================================
-        Groups: {len(groups)}, Depth: {args.depth}, Min-groups: {min_groups}
+        Groups: {len(groups)}, Depth: {args.depth}, Min-groups: {min_groups}, N-jobs: {args.n_jobs}
         Top-K: {args.top_k}
 
-        Note: depth-2 runs make many API calls and may take minutes.
+        Note: depth-2 runs make many API calls; concurrency is rate-limited by OpenAlex.
         Ensure mailto is a real, monitored email address.
 
         Results (sorted by groups_hit desc, score asc, cited_by_count desc):
