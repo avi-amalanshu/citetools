@@ -21,6 +21,12 @@ def main() -> None:
     Results: print each record (score, groups_hit, year, cited_by_count, degree,
     title, doi) to stdout, one record per print block.
 
+    With --resolve, instead prints the canonical W-id for each given id/link
+    (W-id, DOI, or arxiv abs/pdf link) and exits without running the finder.
+
+    With --search, instead prints candidate works (W-id, year, citations,
+    title) for each title query and exits, to help find a W-id for --group.
+
     Known limitations & tuning:
     - depth=2 is the recommended default; depth=3+ adds exponential API cost.
     - --min-groups defaults to full intersection (all N groups); relax to N-1 or N-2
@@ -68,8 +74,59 @@ def main() -> None:
         action="append",
         help="comma-separated seed ids for one group (can be repeated)",
     )
+    parser.add_argument(
+        "--resolve",
+        type=str,
+        action="append",
+        metavar="ID",
+        help="resolve an id/link (W-id, DOI, or arxiv abs/pdf link) to its W-id and exit; repeatable",
+    )
+    parser.add_argument(
+        "--search",
+        type=str,
+        action="append",
+        metavar="QUERY",
+        help="search works by title; print candidate W-ids and exit; repeatable",
+    )
 
     args = parser.parse_args()
+
+    # search mode: list candidate works for each title query, then exit
+    if args.search:
+        client = OpenAlex(mailto=args.mailto)
+        try:
+            for q in args.search:
+                print(f"search: {q}")
+                hits = client.search(q)
+                if not hits:
+                    print("  (no matches)")
+                for w in hits:
+                    wid = w["id"].rsplit("/", 1)[-1].upper()
+                    year = w.get("publication_year") or "????"
+                    cites = w.get("cited_by_count") or 0
+                    # collapse embedded whitespace so each hit stays one line
+                    title = " ".join((w.get("title") or "[no title]").split())
+                    print(f"  {wid}  {year}  cites={cites:>6}  {title[:75]}")
+                print()
+        finally:
+            client.close()
+        return
+
+    # resolve mode: print canonical W-ids for the given ids/links, then exit
+    if args.resolve:
+        client = OpenAlex(mailto=args.mailto)
+        try:
+            for src in args.resolve:
+                try:
+                    wid = client.wid(src)
+                    # collapse embedded whitespace so each line stays one line
+                    title = " ".join((client.work(src).get("title") or "[no title]").split())
+                    print(f"{wid}  {title[:80]}")
+                except Exception as e:
+                    print(f"resolve failed for {src}: {e}", file=sys.stderr)
+        finally:
+            client.close()
+        return
 
     # validate depth
     if args.depth < 1:
