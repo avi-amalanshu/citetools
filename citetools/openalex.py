@@ -14,6 +14,35 @@ from .errors import BadId, OpenAlexError
 
 OPENALEX_BASE = "https://api.openalex.org"
 
+# arxiv abs/pdf url; captures the id, tolerates http(s)://, www., a .pdf suffix
+# and a trailing slash. the id keeps any internal '/' for old-style arxiv ids.
+_ARXIV_URL = re.compile(
+	r"^(?:https?://)?(?:www\.)?arxiv\.org/(?:abs|pdf)/(?P<id>.+?)(?:\.pdf)?/?$",
+	re.IGNORECASE,
+)
+# bare new-style arxiv id, e.g. 2010.11929 or 2010.11929v2
+_ARXIV_ID = re.compile(r"^\d{4}\.\d{4,5}(?:v\d+)?$")
+
+
+def _arxiv_doi(pid: str) -> str | None:
+	"""Map an arxiv abs/pdf link or bare new-style arxiv id to its arxiv doi.
+
+	'https://arxiv.org/abs/2010.11929v2' -> '10.48550/arxiv.2010.11929'
+	'2010.11929'                         -> '10.48550/arxiv.2010.11929'
+	anything not recognisably arxiv      -> None.
+	the version suffix (vN) and a trailing '.pdf' are stripped; an old-style
+	id keeps its internal '/' (e.g. cs/0701001).
+	"""
+	m = _ARXIV_URL.match(pid)
+	if m:
+		aid = m.group("id")
+	elif _ARXIV_ID.match(pid):
+		aid = pid
+	else:
+		return None
+	aid = re.sub(r"v\d+$", "", aid)  # strip version suffix
+	return f"10.48550/arxiv.{aid.lower()}"
+
 
 class _RateLimiter:
 	"""Shared rate-limiter for concurrent threads: caps aggregate request rate at 1/interval req/s.
@@ -147,11 +176,13 @@ class OpenAlex:
 
 	@staticmethod
 	def key(pid: str) -> str:
-		"""Normalize pid (DOI, bare W-id, or OpenAlex URL) to canonical lookup key.
+		"""Normalize pid (DOI, bare W-id, OpenAlex URL, or arxiv link) to canonical lookup key.
 
 		-> 'W12345' (uppercase), 'doi:10.xxxx/yyyy' (lowercase doi), or raises BadId.
 		Accepts: 'W123', 'https://openalex.org/W123', '10.1038/nature12373',
-		  'https://doi.org/10.1038/nature12373'.
+		  'https://doi.org/10.1038/nature12373', 'https://arxiv.org/abs/2010.11929',
+		  'https://arxiv.org/pdf/2010.11929v2', and bare new-style arxiv ids.
+		arxiv links resolve via the arxiv doi 10.48550/arxiv.<id>.
 		"""
 		# reject empty
 		if not pid:
@@ -167,6 +198,12 @@ class OpenAlex:
 			if not re.match(r"^W\d+$", canonical):
 				raise BadId(f"malformed OpenAlex URL: {pid}")
 			return canonical.upper()
+
+		# arxiv abs/pdf link or bare new-style arxiv id -> arxiv doi
+		# (checked before the doi branch: arxiv urls also contain '/')
+		adoi = _arxiv_doi(pid)
+		if adoi is not None:
+			return f"doi:{adoi}"
 
 		# doi: has / but not url scheme (or is https://doi.org/...)
 		if "/" in pid:
@@ -325,6 +362,53 @@ class OpenAlex:
 			out.append(w_id)
 
 		return out
+
+	def search(self, query: str, k: int = 5) -> list[dict[str, Any]]:
+		"""Search works by title; return up to k trimmed candidate records.
+
+		query -> GET /works?filter=title.search:{query}&per-page=k&select=...
+		-> list of trimmed work dicts (id, title, publication_year,
+		cited_by_count, doi), ranked by OpenAlex relevance. caches the trimmed
+		objects in _meta only. blank query -> []. ONE page, no pagination.
+		raises OpenAlexError (HTTP failures).
+		"""
+		if not query.strip():
+			return []
+
+		# rate-limit before HTTP
+		self._limiter.acquire()
+
+		try:
+			params = {
+				"mailto": self.mailto,
+				"filter": f"title.search:{query}",
+				"per-page": k,
+				"select": "id,title,publication_year,cited_by_count,doi",
+			}
+			response = self._session().get(
+				f"{OPENALEX_BASE}/works",
+				params=params,
+				timeout=self.timeout,
+			)
+			response.raise_for_status()
+			results = response.json().get("results", [])
+		except requests.RequestException as e:
+			raise OpenAlexError(f"failed to search works for {query!r}: {e}") from e
+
+		# cache trimmed objects in _meta only
+		for w in results:
+			w_id = w["id"].rsplit("/", 1)[-1].upper()
+			self._meta[w_id] = w
+
+		return results
+
+	def wid(self, pid: str) -> str:
+		"""Resolve any id form to its bare canonical OpenAlex W-id.
+
+		pid (W-id, DOI, OpenAlex URL, or arxiv abs/pdf link) -> work() ->
+		bare 'Wxxxxx'. raises BadId (from key), OpenAlexError (HTTP / not found).
+		"""
+		return self.work(pid)["id"].rsplit("/", 1)[-1].upper()
 
 	def clear(self) -> None:
 		"""Drop all cached full works and metadata.
