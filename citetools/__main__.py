@@ -126,6 +126,14 @@ def main() -> None:
         default="budget",
         help="search mode for bidir strategy (default 'budget'); ignored for intersection",
     )
+    parser.add_argument(
+        "--frontier-cap",
+        type=int,
+        default=50,
+        help="bidir budget-mode per-step frontier cap, per pairwise engine: the "
+        "compute budget for each search step (default 50). ignored in exact mode "
+        "and for the intersection strategy",
+    )
 
     args = parser.parse_args()
 
@@ -177,6 +185,10 @@ def main() -> None:
     # validate n-jobs
     if args.n_jobs < 1:
         raise ValueError("n-jobs must be >= 1")
+
+    # validate frontier-cap
+    if args.frontier_cap < 1:
+        raise ValueError("frontier-cap must be >= 1")
 
     # validate strategy and mode interaction
     if args.strategy not in ["intersection", "bidir"]:
@@ -240,6 +252,7 @@ def main() -> None:
                 group_b=groups[1],
                 mode=args.mode,
                 max_depth=args.depth,
+                frontier_cap=args.frontier_cap,
                 top_k=args.top_k,
                 n_jobs=args.n_jobs,
                 verbose=args.verbose,
@@ -252,6 +265,7 @@ def main() -> None:
                 min_groups=min_groups,
                 mode=args.mode,
                 max_depth=args.depth,
+                frontier_cap=args.frontier_cap,
                 top_k=args.top_k,
                 n_jobs=args.n_jobs,
                 verbose=args.verbose,
@@ -260,7 +274,7 @@ def main() -> None:
     # print header
     strategy_info = f"Strategy: {args.strategy}"
     if args.strategy == "bidir":
-        strategy_info += f", Mode: {args.mode}"
+        strategy_info += f", Mode: {args.mode}, Frontier-cap: {args.frontier_cap}"
 
     msg = textwrap.dedent(
         f"""\

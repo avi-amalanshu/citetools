@@ -40,9 +40,10 @@ A lazy search: instead of pre-growing a fixed-radius ball, it expands a frontier
 from each group and stops where the frontiers meet. It never materialises more of the
 graph than it needs. Two modes:
 
-- **`budget`** (default): caps each frontier and stops at the first meeting. A fast,
-  bounded, approximate answer: the search is deliberately constrained to a sensible
-  compute budget.
+- **`budget`** (default): caps each frontier to `--frontier-cap` papers per step
+  (default **50**; for N>=3 this cap applies *per pairwise engine*) and stops at the
+  first meeting. A fast, bounded, approximate answer — the search is deliberately
+  constrained to a sensible compute budget.
 - **`exact`** (opt-in, `--mode exact`): no cap; runs until it can prove it has the
   genuinely shortest connecting bridges. Higher and unbounded cost.
 
@@ -134,6 +135,7 @@ the graph-convolutional-networks paper (`W2519887557`), and prints, among others
 | `--mailto` | email for the OpenAlex polite pool (required) | : |
 | `--strategy` | `intersection` or `bidir` | `intersection` |
 | `--mode` | `budget` or `exact`; applies to `bidir` only, ignored otherwise | `budget` |
+| `--frontier-cap` | `bidir` budget-mode per-step frontier cap, *per pairwise engine* (the compute budget); ignored in exact mode and for `intersection` | 50 |
 | `--group` | one research area; comma-separated seed ids; repeat per area | demo set |
 | `--depth` | citation hops expanded (per seed for `intersection`, per side for `bidir`) | 2 |
 | `--top-k` | number of bridges to return | 25 |
@@ -336,9 +338,10 @@ pure-CPU search core whose decisions never depend on fetch timing.
   citation hops of every group's seeds; raising `--depth` reaches further at cost
   that grows roughly exponentially in depth.
 - `bidir --mode budget` (the default) is a *bounded approximation*: it caps each
-  frontier and stops at the first meeting, so it can miss a better bridge that a
-  fuller search would find. Use `--mode exact`, or the `intersection` strategy, when
-  completeness matters.
+  frontier (`--frontier-cap`, default 50, per pairwise engine) and stops at the first
+  meeting, so it can miss a better bridge that a fuller search would find. Raise
+  `--frontier-cap` for a wider search, or use `--mode exact` / the `intersection`
+  strategy, when completeness matters.
 - `bidir` for N>=3 is a pairwise decomposition, not a true intersection: it can
   surface a paper that strongly bridges some group-pairs without being central to all
   groups. The `recurrence` field and the per-group `dists` let you judge this; for a
