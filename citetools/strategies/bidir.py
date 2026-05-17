@@ -67,13 +67,14 @@ class BiDirEngine:
 		*,
 		mode: str = "budget",
 		max_depth: int = 6,
-		frontier_cap: int = 50,
+		frontier_cap: int | None = 50,
 		want_paths: bool = False,
 	) -> None:
 		"""Initialize bidirectional search engine.
 
 		Raises ValueError if group_a or group_b is empty.
 		Stores mode, max_depth, frontier_cap, want_paths.
+		frontier_cap=None disables the internal cap (driver prunes instead).
 		Initializes distance maps and frontier for both sides.
 		Records any shared seeds (group_a & group_b) as meetings with dist 0/0.
 		Proc:
@@ -176,8 +177,8 @@ class BiDirEngine:
 								"b": self._dist["b"][m],
 							}
 
-			# budget mode: cap discovered set
-			if self.mode == "budget" and len(discovered) > self.frontier_cap:
+			# budget mode: cap discovered set (None disables cap)
+			if self.mode == "budget" and self.frontier_cap is not None and len(discovered) > self.frontier_cap:
 				discovered = set(sorted(discovered)[: self.frontier_cap])
 
 			self._frontier[side] = discovered
