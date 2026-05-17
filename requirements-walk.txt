@@ -1,0 +1,4 @@
+# Optional dependencies for walk strategy
+# Install with: pip install -r requirements-walk.txt
+# Note: sentence-transformers pulls torch + transformers as transitive deps (big footprint on disk)
+sentence-transformers>=3.0
