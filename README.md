@@ -48,7 +48,7 @@ from each scores 4 and ranks below it; a paper reachable from only one group has
 ## Environment setup
 
 ```
-pip install -r requirements.txt    # requests, networkx
+pip install -r requirements.txt    # requests, networkx, joblib
 ```
 
 Python 3.10+.
@@ -88,8 +88,9 @@ each a genuine attention <-> graph-networks bridge.
 | `--depth` | citation hops expanded around each seed | 2 |
 | `--top-k` | number of bridges to return | 25 |
 | `--min-groups` | how many groups a candidate must reach to qualify | all groups |
+| `--n-jobs` | worker threads for concurrent fetching; 1 = serial | 8 |
 
-a `--depth 2` run makes many API calls and takes a few minutes.
+a `--depth 2` run makes many API calls and takes a few minutes; concurrency speeds this up (bounded by the ~10 req/s polite pool rate).
 
 ### Library
 
@@ -114,10 +115,14 @@ three layers, each its own module:
   over the OpenAlex REST API: id normalisation, single + batched work fetches, and
   incoming-citation lookups. the one stateful object (an HTTP session + a response
   cache); every method is a memoised fetch.
+- **`citetools/parallel.py`**: L1.5, the concurrent fetch layer (`fetch_all`). uses
+  a thread pool and shared rate limiter to fetch multiple nodes' neighbour lists in
+  parallel during each BFS hop, without exceeding the OpenAlex polite pool rate limit
+  (~10 req/s).
 - **`citetools/graph.py`**: L2, the `CiteGraph` lazy oracle. expands a citation
-  neighbourhood around a seed by breadth-first search, fetching a node's neighbours
-  only when asked and capping the expansion frontier so cost stays bounded. produces
-  a `networkx` directed graph.
+  neighbourhood around a seed by breadth-first search. each hop fetches the frontier's
+  neighbours concurrently (via `parallel.py`), only when asked, and caps expansion so
+  cost stays bounded. produces a `networkx` directed graph.
 - **`citetools/strategies/intersection.py`**: L3, `find_bridges`. grows a
   neighbourhood per group, scores every non-seed node by its summed shortest-path
   distance to each group (computed per group, one multi-source BFS each), keeps the
@@ -127,6 +132,14 @@ supporting files: `citetools/errors.py` (the `OpenAlexError` / `BadId` exception
 `citetools/strategies/__init__.py` (the `strategies` subpackage: future search
 strategies plug in here behind the same `(oracle, groups, ...)` signature),
 `citetools/__init__.py` (the public API), `citetools/__main__.py` (the CLI).
+
+## Concurrency
+
+the bridge finder parallelizes I/O *within* each BFS hop: all frontier nodes' neighbour lists are fetched concurrently over a thread pool (controlled by `--n-jobs`, default 8). BFS hops themselves remain sequential.
+
+a shared rate limiter keeps the aggregate request rate within the OpenAlex polite pool's ceiling (~10 req/s), regardless of thread count. concurrency hides per-request latency, not request volume: it can only reclaim the rate budget that serial execution leaves idle while stalling on latency, never exceed the polite-pool cap. see [limitations](#limitations) for the measured speedup.
+
+output is deterministic and independent of `--n-jobs`: results with `--n-jobs 8` are identical to `--n-jobs 1`, thanks to a fixed total-order tie-break in ranking.
 
 ## Limitations
 
@@ -147,3 +160,9 @@ strategies plug in here behind the same `(oracle, groups, ...)` signature),
   but not sufficient for discovery.
 - depth-2 over genuinely distant fields can return an empty intersection; relax
   `--min-groups`.
+- concurrency gains are modest and rate-capped. `--n-jobs` only reclaims the rate
+  budget a serial run wastes stalling on per-request latency; it cannot exceed the
+  ~10 req/s polite-pool ceiling. a depth-2 demo measured ~1.45x (35s -> 24s): the
+  concurrent run saturates the polite pool, the serial run left it ~30% idle. the
+  metadata batch fetches and the per-seed loop stay sequential and bound the gain
+  further, so more than a handful of threads does not help.
