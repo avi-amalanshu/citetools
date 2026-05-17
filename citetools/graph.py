@@ -121,6 +121,12 @@ class CiteGraph:
           across hops). Thus, no two threads call nbrs(same_node) concurrently.
           Cache writes are per-distinct-key only; CPython per-key dict writes are
           GIL-atomic.
+
+          This thread-safety property also holds under the bidirectional N-way
+          aggregator (strategies/bidir.py): the aggregator performs round-level
+          union-dedup of all pair frontiers before each concurrent fetch_all batch,
+          guaranteeing distinct nodes within each batch. No two threads call
+          nbrs(same_node) concurrently in that usage either.
         """
         if node in self._nbrs_cache:
             return self._nbrs_cache[node]
