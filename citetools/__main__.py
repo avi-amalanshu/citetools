@@ -1,0 +1,155 @@
+import argparse
+import sys
+import textwrap
+
+from citetools import CiteGraph, OpenAlex, find_bridges
+
+# demo seeds as canonical openalex w-ids (arxiv dois are not reliably indexed):
+# "attention is all you need", the gcn paper, alphafold.
+DEMO_GROUPS = [
+    ["W2626778328"],
+    ["W2519887557"],
+    ["W3177828909"],
+]
+
+
+def main() -> None:
+    """
+    CLI entry point: parse arguments, construct pipeline, run, print results.
+
+    Pipeline: argparse → validate groups → OpenAlex → CiteGraph → find_bridges.
+    Results: print each record (score, groups_hit, year, cited_by_count, degree,
+    title, doi) to stdout, one record per print block.
+
+    Known limitations & tuning:
+    - depth=2 is the recommended default; depth=3+ adds exponential API cost.
+    - --min-groups defaults to full intersection (all N groups); relax to N-1 or N-2
+      if results are empty.
+    - --top-k ranks by (groups_hit desc, score asc, cited_by_count desc); lower
+      score indicates a more central bridge within reachable groups.
+    - the "degree" field (node degree in its group graph) helps spot hub-dominated
+      results; see --min-groups tuning.
+    """
+    parser = argparse.ArgumentParser(prog="citetools")
+
+    parser.add_argument(
+        "--mailto",
+        type=str,
+        required=True,
+        help="email for OpenAlex polite pool",
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=2,
+        help="BFS hops (default 2)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=25,
+        help="return top K results (default 25)",
+    )
+    parser.add_argument(
+        "--min-groups",
+        type=int,
+        default=None,
+        help="minimum group count for a candidate to qualify (default: number of groups passed)",
+    )
+    parser.add_argument(
+        "--group",
+        type=str,
+        action="append",
+        help="comma-separated seed ids for one group (can be repeated)",
+    )
+
+    args = parser.parse_args()
+
+    # validate depth
+    if args.depth < 1:
+        raise ValueError("depth must be >= 1")
+
+    # validate top-k
+    if args.top_k < 1:
+        raise ValueError("top-k must be >= 1")
+
+    # handle groups: parse or use demo
+    if args.group is None:
+        groups = DEMO_GROUPS
+        print("Using demo groups (no --group passed).", file=sys.stderr)
+    else:
+        groups = []
+        for group_str in args.group:
+            # split on commas and strip whitespace
+            ids = [id.strip() for id in group_str.split(",")]
+            # check for empty groups
+            if not ids or all(not id for id in ids):
+                raise ValueError("empty group")
+            # filter out empty strings
+            ids = [id for id in ids if id]
+            groups.append(ids)
+
+    # finalize min_groups
+    if args.min_groups is None:
+        min_groups = len(groups)
+    else:
+        min_groups = args.min_groups
+
+    # construct pipeline
+    client = OpenAlex(mailto=args.mailto)
+    oracle = CiteGraph(client)
+
+    # call find_bridges
+    results = find_bridges(
+        oracle=oracle,
+        groups=groups,
+        depth=args.depth,
+        min_groups=min_groups,
+        top_k=args.top_k,
+    )
+
+    # print header
+    msg = textwrap.dedent(
+        f"""\
+        Citation bridge finder (citetools)
+        ==================================
+        Groups: {len(groups)}, Depth: {args.depth}, Min-groups: {min_groups}
+        Top-K: {args.top_k}
+
+        Note: depth-2 runs make many API calls and may take minutes.
+        Ensure mailto is a real, monitored email address.
+
+        Results (sorted by groups_hit desc, score asc, cited_by_count desc):
+        """
+    )
+    print(msg, file=sys.stdout)
+
+    # print each result
+    for r in results:
+        # safe extraction: handle missing/None fields
+        score = r.get("score", "—")
+        groups_hit = r.get("groups_hit", 0)
+        year = r.get("year") or "—"
+        cited_by = r.get("cited_by_count") or 0
+        degree = r.get("degree") or 0
+        title = r.get("title") or "[no title]"
+        doi = r.get("doi") or "[no DOI]"
+
+        # print in readable format
+        print(
+            f"{score:>3}  hit={groups_hit}  {year}  cites={cited_by:>5}  "
+            f"degree={degree:>3}  {title[:80]}"
+        )
+        print(f"     {doi}")
+        print()  # blank line between records
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        sys.exit(1)
