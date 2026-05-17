@@ -285,7 +285,7 @@ def find_bridges_bidir(
 		while not step.done:
 			hop += 1
 			log.info("  hop %d: fetching neighbours of %d node(s)", hop, len(step.frontier))
-			nbrs = fetch_all(oracle, sorted(step.frontier), parallel)
+			nbrs = fetch_all(oracle, sorted(step.frontier), parallel, progress=verbose)
 			step = engine.advance(StepIn(nbrs=nbrs))
 			log.info("  hop %d: %d meeting node(s) so far", hop, len(step.state.meeting))
 
@@ -421,7 +421,7 @@ def find_bridges_bidir_nway(
 				"  round %d: %d live engine(s), fetching %d node(s)",
 				round_n, len(live), len(union),
 			)
-			nbrs = fetch_all(oracle, union, parallel)
+			nbrs = fetch_all(oracle, union, parallel, progress=verbose)
 			next_live = {}
 			for key, step in live.items():
 				# extract this engine's subset of fetched neighbours

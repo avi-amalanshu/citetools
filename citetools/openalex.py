@@ -1,5 +1,6 @@
 """OpenAlex HTTP client with polite-pool retry and dual caching."""
 
+import logging
 import re
 import threading
 import time
@@ -13,6 +14,13 @@ from urllib3.util.retry import Retry
 from .errors import BadId, OpenAlexError
 
 OPENALEX_BASE = "https://api.openalex.org"
+
+log = logging.getLogger("citetools.openalex")
+
+# bounded GET retries on a 429/5xx before giving up
+_MAX_ATTEMPTS = 5
+# ceiling (seconds) on any single fleet-wide cooldown, incl. a server Retry-After
+_COOLDOWN_CAP = 60.0
 
 # arxiv abs/pdf url; captures the id, tolerates http(s)://, www., a .pdf suffix
 # and a trailing slash. the id keeps any internal '/' for old-style arxiv ids.
@@ -44,12 +52,32 @@ def _arxiv_doi(pid: str) -> str | None:
 	return f"10.48550/arxiv.{aid.lower()}"
 
 
+def _retry_after(response: requests.Response) -> float | None:
+	"""Parse a Retry-After header to seconds.
+
+	integer-seconds form -> float; absent or http-date form -> None (the
+	caller falls back to exponential backoff). a non-positive value is
+	treated as absent.
+	"""
+	raw = response.headers.get("Retry-After")
+	if raw is None:
+		return None
+	try:
+		secs = float(raw)
+	except ValueError:
+		return None
+	return secs if secs > 0 else None
+
+
 class _RateLimiter:
 	"""Shared rate-limiter for concurrent threads: caps aggregate request rate at 1/interval req/s.
 
 	acquire() reserves a thread's slot under a lock (O(1) per-thread), then sleeps outside the
 	lock. N threads thus reserve staggered slots and reach throughput N threads concurrently
 	requesting, with aggregate rate exactly 1/interval req/s, without serializing to 1 req/s.
+
+	penalize() registers a server throttle by pushing the shared slot forward, so every thread
+	cools down together; relax() clears the escalation after a success.
 	"""
 
 	def __init__(self, interval: float) -> None:
@@ -60,6 +88,7 @@ class _RateLimiter:
 		self.interval = interval
 		self._lock = threading.Lock()
 		self._next = 0.0
+		self._strikes = 0  # consecutive server-throttle events
 
 	def acquire(self) -> None:
 		"""Reserve this thread's slot and sleep appropriately.
@@ -77,6 +106,28 @@ class _RateLimiter:
 		wait = start - now
 		if wait > 0:
 			time.sleep(wait)
+
+	def penalize(self, retry_after: float | None = None) -> float:
+		"""Register a server throttle (429/5xx): push the shared slot forward.
+
+		Every thread's next acquire() then blocks until the cooldown elapses,
+		so the whole client backs off together. cooldown = the server's
+		Retry-After when given, else exponential in the consecutive-strike
+		count; capped at _COOLDOWN_CAP. returns the cooldown applied (seconds).
+		"""
+		with self._lock:
+			self._strikes += 1
+			if retry_after is not None:
+				cooldown = min(retry_after, _COOLDOWN_CAP)
+			else:
+				cooldown = min(2.0 ** self._strikes, _COOLDOWN_CAP)
+			self._next = max(self._next, time.monotonic() + cooldown)
+			return cooldown
+
+	def relax(self) -> None:
+		"""A request succeeded: clear the consecutive-strike counter."""
+		with self._lock:
+			self._strikes = 0
 
 
 class OpenAlex:
@@ -142,9 +193,9 @@ class OpenAlex:
 		"""Return the session for the current thread.
 
 		Test path: if session was injected, return it directly (shared across threads).
-		Production path: lazily build per-thread session from self._local, mount Retry
-		adapter with identical settings (total=5, backoff_factor=1.0, status_forcelist
-		=[429,500,502,503,504], respect_retry_after_header=True), set User-Agent header,
+		Production path: lazily build per-thread session from self._local, mount a
+		Retry adapter for transport-level errors only (total=2, no status_forcelist
+		-- 429/5xx are handled by _get's fleet-wide cooldown), set User-Agent header,
 		and register it in self._sessions for cleanup on close().
 		"""
 		if self._injected_session is not None:
@@ -155,13 +206,9 @@ class OpenAlex:
 			s = requests.Session()
 			s.headers["User-Agent"] = f"citetools/1.0 ({self.mailto})"
 
-			# configure retry on both schemes
-			retry = Retry(
-				total=5,
-				backoff_factor=1.0,
-				status_forcelist=[429, 500, 502, 503, 504],
-				respect_retry_after_header=True,
-			)
+			# retry transport-level errors only; 429/5xx go through _get's
+			# fleet-wide cooldown so all threads back off together
+			retry = Retry(total=2, status_forcelist=[], respect_retry_after_header=False)
 			adapter = HTTPAdapter(max_retries=retry)
 			s.mount("http://", adapter)
 			s.mount("https://", adapter)
@@ -173,6 +220,48 @@ class OpenAlex:
 				self._sessions.append(s)
 
 		return self._local.session
+
+	def _get(self, url: str, params: dict, *, desc: str) -> dict:
+		"""Rate-limited GET with fleet-wide cooldown retry on 429 / 5xx.
+
+		desc: short human label for the resource, used in logs and errors.
+		Proc: for up to _MAX_ATTEMPTS attempts:
+		  - _limiter.acquire() -- blocks for any pending fleet-wide cooldown
+		  - GET; a transport-level error -> raise OpenAlexError immediately
+		  - status 429 or >= 500 -> _limiter.penalize(Retry-After), log a
+		    warning, retry
+		  - else -> raise_for_status, _limiter.relax(), return parsed json
+		Exhausting all attempts -> raise OpenAlexError naming desc.
+		raises OpenAlexError (transport failure, non-retryable status, or
+		retries exhausted).
+		"""
+		for attempt in range(1, _MAX_ATTEMPTS + 1):
+			self._limiter.acquire()
+			try:
+				response = self._session().get(url, params=params, timeout=self.timeout)
+			except requests.RequestException as e:
+				raise OpenAlexError(f"failed to fetch {desc}: {e}") from e
+
+			if response.status_code == 429 or response.status_code >= 500:
+				cooldown = self._limiter.penalize(_retry_after(response))
+				log.warning(
+					"openalex %d on %s; cooling down %.1fs (attempt %d/%d)",
+					response.status_code, desc, cooldown, attempt, _MAX_ATTEMPTS,
+				)
+				continue
+
+			try:
+				response.raise_for_status()
+				data = response.json()
+			except requests.RequestException as e:
+				raise OpenAlexError(f"failed to fetch {desc}: {e}") from e
+
+			self._limiter.relax()
+			return data
+
+		raise OpenAlexError(
+			f"failed to fetch {desc}: still rate-limited after {_MAX_ATTEMPTS} attempts"
+		)
 
 	@staticmethod
 	def key(pid: str) -> str:
@@ -232,17 +321,9 @@ class OpenAlex:
 		if lookup_key in self._cache:
 			return self._cache[lookup_key]
 
-		# rate-limit before HTTP
-		self._limiter.acquire()
-
-		# fetch
+		# fetch via the rate-limited, cooldown-aware GET helper
 		url = f"{OPENALEX_BASE}/works/{lookup_key}"
-		try:
-			response = self._session().get(url, params=self.params, timeout=self.timeout)
-			response.raise_for_status()
-			data = response.json()
-		except requests.RequestException as e:
-			raise OpenAlexError(f"failed to fetch work {lookup_key}: {e}") from e
+		data = self._get(url, self.params, desc=f"work {lookup_key}")
 
 		# extract canonical wid
 		canonical_wid = data["id"].rsplit("/", 1)[-1].upper()
@@ -291,19 +372,12 @@ class OpenAlex:
 			chunk = w_ids_to_fetch[i : i + 50]
 			filter_str = "openalex:" + "|".join(chunk)
 
-			# rate-limit before HTTP
-			self._limiter.acquire()
-
-			try:
-				response = self._session().get(
-					f"{OPENALEX_BASE}/works",
-					params={**self.params, "filter": filter_str, "per-page": 50},
-					timeout=self.timeout,
-				)
-				response.raise_for_status()
-				batch_data = response.json()["results"]
-			except requests.RequestException as e:
-				raise OpenAlexError(f"failed to fetch batch {filter_str}: {e}") from e
+			batch = self._get(
+				f"{OPENALEX_BASE}/works",
+				{**self.params, "filter": filter_str, "per-page": 50},
+				desc=f"batch {filter_str}",
+			)
+			batch_data = batch["results"]
 
 			# cache each work
 			for w in batch_data:
@@ -330,27 +404,17 @@ class OpenAlex:
 		seed_work = self.work(pid)
 		canonical_wid = seed_work["id"].rsplit("/", 1)[-1].upper()
 
-		# rate-limit before HTTP
-		self._limiter.acquire()
-
-		# fetch citers
-		try:
-			params = {
-				"mailto": self.mailto,
-				"filter": f"cites:{canonical_wid}",
-				"sort": "cited_by_count:desc",
-				"per-page": k,
-				"select": "id,title,publication_year,cited_by_count,doi",
-			}
-			response = self._session().get(
-				f"{OPENALEX_BASE}/works",
-				params=params,
-				timeout=self.timeout,
-			)
-			response.raise_for_status()
-			page_data = response.json()
-		except requests.RequestException as e:
-			raise OpenAlexError(f"failed to fetch citers of {canonical_wid}: {e}") from e
+		# fetch citers via the rate-limited, cooldown-aware GET helper
+		params = {
+			"mailto": self.mailto,
+			"filter": f"cites:{canonical_wid}",
+			"sort": "cited_by_count:desc",
+			"per-page": k,
+			"select": "id,title,publication_year,cited_by_count,doi",
+		}
+		page_data = self._get(
+			f"{OPENALEX_BASE}/works", params, desc=f"citers of {canonical_wid}"
+		)
 
 		# extract and cache in _meta only
 		results = page_data.get("results", [])
@@ -375,25 +439,16 @@ class OpenAlex:
 		if not query.strip():
 			return []
 
-		# rate-limit before HTTP
-		self._limiter.acquire()
-
-		try:
-			params = {
-				"mailto": self.mailto,
-				"filter": f"title.search:{query}",
-				"per-page": k,
-				"select": "id,title,publication_year,cited_by_count,doi",
-			}
-			response = self._session().get(
-				f"{OPENALEX_BASE}/works",
-				params=params,
-				timeout=self.timeout,
-			)
-			response.raise_for_status()
-			results = response.json().get("results", [])
-		except requests.RequestException as e:
-			raise OpenAlexError(f"failed to search works for {query!r}: {e}") from e
+		params = {
+			"mailto": self.mailto,
+			"filter": f"title.search:{query}",
+			"per-page": k,
+			"select": "id,title,publication_year,cited_by_count,doi",
+		}
+		page = self._get(
+			f"{OPENALEX_BASE}/works", params, desc=f"works matching {query!r}"
+		)
+		results = page.get("results", [])
 
 		# cache trimmed objects in _meta only
 		for w in results:

@@ -229,10 +229,7 @@ def main() -> None:
     if args.frontier_cap < 1:
         raise ValueError("frontier-cap must be >= 1")
 
-    # validate strategy and mode interaction
-    if args.strategy not in ["intersection", "bidir"]:
-        raise ValueError(f"strategy must be 'intersection' or 'bidir', got {args.strategy}")
-
+    # validate strategy and mode interaction (strategy already constrained by argparse choices)
     if args.mode not in ["budget", "exact"]:
         raise ValueError(f"mode must be 'budget' or 'exact', got {args.mode}")
 
