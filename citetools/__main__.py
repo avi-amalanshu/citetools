@@ -3,7 +3,7 @@ import logging
 import sys
 import textwrap
 
-from citetools import CiteGraph, OpenAlex, find_bridges
+from citetools import CiteGraph, OpenAlex, find_bridges, find_bridges_bidir, find_bridges_bidir_nway
 
 
 def _setup_logging() -> None:
@@ -112,6 +112,20 @@ def main() -> None:
         action="store_true",
         help="also stream live per-fetch progress (joblib) to stderr",
     )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        choices=["intersection", "bidir"],
+        default="intersection",
+        help="bridging strategy: 'intersection' (default) or 'bidir' (bidirectional)",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["budget", "exact"],
+        default="budget",
+        help="search mode for bidir strategy (default 'budget'); ignored for intersection",
+    )
 
     args = parser.parse_args()
 
@@ -164,6 +178,17 @@ def main() -> None:
     if args.n_jobs < 1:
         raise ValueError("n-jobs must be >= 1")
 
+    # validate strategy and mode interaction
+    if args.strategy not in ["intersection", "bidir"]:
+        raise ValueError(f"strategy must be 'intersection' or 'bidir', got {args.strategy}")
+
+    if args.mode not in ["budget", "exact"]:
+        raise ValueError(f"mode must be 'budget' or 'exact', got {args.mode}")
+
+    if args.strategy == "intersection" and args.mode != "budget":
+        # mode is only meaningful for bidir; silently allow for intersection
+        pass
+
     # handle groups: parse or use demo
     if args.group is None:
         groups = DEMO_GROUPS
@@ -180,6 +205,11 @@ def main() -> None:
             ids = [id for id in ids if id]
             groups.append(ids)
 
+    # strategy-specific group count validation
+    if args.strategy == "bidir":
+        if len(groups) == 1:
+            raise ValueError("bidir strategy requires >= 2 groups; got 1")
+
     # finalize min_groups
     if args.min_groups is None:
         min_groups = len(groups)
@@ -190,23 +220,53 @@ def main() -> None:
     client = OpenAlex(mailto=args.mailto)
     oracle = CiteGraph(client)
 
-    # call find_bridges
-    results = find_bridges(
-        oracle=oracle,
-        groups=groups,
-        depth=args.depth,
-        min_groups=min_groups,
-        top_k=args.top_k,
-        n_jobs=args.n_jobs,
-        verbose=args.verbose,
-    )
+    # dispatch on strategy
+    if args.strategy == "intersection":
+        results = find_bridges(
+            oracle=oracle,
+            groups=groups,
+            depth=args.depth,
+            min_groups=min_groups,
+            top_k=args.top_k,
+            n_jobs=args.n_jobs,
+            verbose=args.verbose,
+        )
+    elif args.strategy == "bidir":
+        if len(groups) == 2:
+            # exactly 2 groups: use pairwise bidirectional
+            results = find_bridges_bidir(
+                oracle=oracle,
+                group_a=groups[0],
+                group_b=groups[1],
+                mode=args.mode,
+                max_depth=args.depth,
+                top_k=args.top_k,
+                n_jobs=args.n_jobs,
+                verbose=args.verbose,
+            )
+        else:
+            # >= 3 groups: use n-way bidirectional
+            results = find_bridges_bidir_nway(
+                oracle=oracle,
+                groups=groups,
+                min_groups=min_groups,
+                mode=args.mode,
+                max_depth=args.depth,
+                top_k=args.top_k,
+                n_jobs=args.n_jobs,
+                verbose=args.verbose,
+            )
 
     # print header
+    strategy_info = f"Strategy: {args.strategy}"
+    if args.strategy == "bidir":
+        strategy_info += f", Mode: {args.mode}"
+
     msg = textwrap.dedent(
         f"""\
         Citation bridge finder (citetools)
         ==================================
-        Groups: {len(groups)}, Depth: {args.depth}, Min-groups: {min_groups}, N-jobs: {args.n_jobs}
+        Groups: {len(groups)}, Depth: {args.depth}, Min-groups: {min_groups}, {strategy_info}, N-jobs: {args.n_jobs}
         Top-K: {args.top_k}
 
         Note: depth-2 runs make many API calls; concurrency is rate-limited by OpenAlex.
