@@ -3,7 +3,7 @@ import logging
 import sys
 import textwrap
 
-from citetools import CiteGraph, OpenAlex, find_bridges, find_bridges_bidir, find_bridges_bidir_nway
+from citetools import CiteGraph, OpenAlex, find_bridges, find_bridges_bidir, find_bridges_bidir_nway, find_bridges_walk
 
 
 def _setup_logging() -> None:
@@ -115,9 +115,9 @@ def main() -> None:
     parser.add_argument(
         "--strategy",
         type=str,
-        choices=["intersection", "bidir"],
+        choices=["intersection", "bidir", "walk"],
         default="intersection",
-        help="bridging strategy: 'intersection' (default) or 'bidir' (bidirectional)",
+        help="bridging strategy: 'intersection' (default), 'bidir' (bidirectional), or 'walk' (semantic-ensemble)",
     )
     parser.add_argument(
         "--mode",
@@ -133,6 +133,45 @@ def main() -> None:
         help="bidir budget-mode per-step frontier cap, per pairwise engine: the "
         "compute budget for each search step (default 50). ignored in exact mode "
         "and for the intersection strategy",
+    )
+    parser.add_argument(
+        "--ensemble",
+        action="store_true",
+        default=False,
+        help="walk: run a randomized ensemble (default: single deterministic run)",
+    )
+    parser.add_argument(
+        "-M",
+        "--ensemble-runs",
+        type=int,
+        default=5,
+        help="walk: number of ensemble runs (default 5; used only with --ensemble)",
+    )
+    parser.add_argument(
+        "-p",
+        "--floor-prob",
+        type=float,
+        default=0.15,
+        help="walk: floor reserve probability for stochastic pruning (default 0.15)",
+    )
+    parser.add_argument(
+        "-T",
+        "--temperature",
+        type=float,
+        default=0.1,
+        help="walk: pruning sigmoid temperature (default 0.1)",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.7,
+        help="walk: structural-vs-embedding fusion weight (default 0.7; 1.0=pure structural)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="walk: RNG master seed for reproducibility (default: unseeded)",
     )
 
     args = parser.parse_args()
@@ -200,6 +239,17 @@ def main() -> None:
     if args.strategy == "intersection" and args.mode != "budget":
         # mode is only meaningful for bidir; silently allow for intersection
         pass
+
+    # walk-specific validation
+    if args.strategy == "walk":
+        if not (0 < args.floor_prob < 1):
+            raise ValueError(f"floor-prob must be in (0, 1); got {args.floor_prob}")
+        if args.temperature <= 0:
+            raise ValueError(f"temperature must be > 0; got {args.temperature}")
+        if args.ensemble_runs < 1:
+            raise ValueError(f"ensemble-runs must be >= 1; got {args.ensemble_runs}")
+        if not (0 <= args.alpha <= 1):
+            raise ValueError(f"alpha must be in [0, 1]; got {args.alpha}")
 
     # handle groups: parse or use demo
     if args.group is None:
@@ -270,6 +320,22 @@ def main() -> None:
                 n_jobs=args.n_jobs,
                 verbose=args.verbose,
             )
+    elif args.strategy == "walk":
+        results = find_bridges_walk(
+            oracle=oracle,
+            groups=groups,
+            depth=args.depth,
+            min_groups=min_groups,
+            top_k=args.top_k,
+            ensemble=args.ensemble,
+            M=args.ensemble_runs,
+            p=args.floor_prob,
+            T=args.temperature,
+            alpha=args.alpha,
+            seed=args.seed,
+            n_jobs=args.n_jobs,
+            verbose=args.verbose,
+        )
 
     # print header
     strategy_info = f"Strategy: {args.strategy}"

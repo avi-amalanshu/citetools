@@ -5,7 +5,7 @@ __version__ = "0.1.0"
 from .errors import OpenAlexError, BadId
 from .openalex import OpenAlex
 from .graph import CiteGraph
-from .strategies import find_bridges, find_bridges_bidir, find_bridges_bidir_nway
+from .strategies import find_bridges, find_bridges_bidir, find_bridges_bidir_nway, find_bridges_walk
 
 __all__ = [
     "OpenAlex",
@@ -13,6 +13,7 @@ __all__ = [
     "find_bridges",
     "find_bridges_bidir",
     "find_bridges_bidir_nway",
+    "find_bridges_walk",
     "OpenAlexError",
     "BadId",
 ]
