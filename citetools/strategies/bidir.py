@@ -267,6 +267,10 @@ def find_bridges_bidir(
 
 	canon_a = {oracle.client.key(s) for s in group_a}
 	canon_b = {oracle.client.key(s) for s in group_b}
+	log.info(
+		"bidir: %d + %d seeds, mode=%s, max_depth=%d",
+		len(canon_a), len(canon_b), mode, max_depth,
+	)
 
 	engine = BiDirEngine(
 		canon_a, canon_b, mode=mode, max_depth=max_depth, frontier_cap=frontier_cap
@@ -276,9 +280,13 @@ def find_bridges_bidir(
 		n_jobs=n_jobs, backend="threading", verbose=10 if verbose else 0
 	) as parallel:
 		step = engine.advance(StepIn(nbrs={}))
+		hop = 0
 		while not step.done:
+			hop += 1
+			log.info("  hop %d: fetching neighbours of %d node(s)", hop, len(step.frontier))
 			nbrs = fetch_all(oracle, sorted(step.frontier), parallel)
 			step = engine.advance(StepIn(nbrs=nbrs))
+			log.info("  hop %d: %d meeting node(s) so far", hop, len(step.state.meeting))
 
 	meeting = step.state.meeting
 	seeds = canon_a | canon_b
@@ -308,6 +316,7 @@ def find_bridges_bidir(
 	records.sort(
 		key=lambda r: (r["score"], -(r.get("cited_by_count") or 0), r["id"])
 	)
+	log.info("bidir: done, %d bridge(s)", len(records))
 	return records[:top_k]
 
 
@@ -386,6 +395,10 @@ def find_bridges_bidir_nway(
 		)
 		for i, j in pairs
 	}
+	log.info(
+		"bidir n-way: %d groups, %d pairs, mode=%s, max_depth=%d",
+		N, len(pairs), mode, max_depth,
+	)
 
 	# round-robin drive all engines
 	with Parallel(
@@ -399,8 +412,14 @@ def find_bridges_bidir_nway(
 				live[key] = step
 
 		# rounds: drive all live engines in lockstep
+		round_n = 0
 		while live:
+			round_n += 1
 			union = sorted(set().union(*(s.frontier for s in live.values())))
+			log.info(
+				"  round %d: %d live engine(s), fetching %d node(s)",
+				round_n, len(live), len(union),
+			)
 			nbrs = fetch_all(oracle, union, parallel)
 			next_live = {}
 			for key, step in live.items():
@@ -454,4 +473,5 @@ def find_bridges_bidir_nway(
 	records.sort(
 		key=lambda r: (-r["groups_hit"], r["score"], -(r.get("cited_by_count") or 0), r["id"])
 	)
+	log.info("bidir n-way: done, %d candidate(s)", len(records))
 	return records[:top_k]
