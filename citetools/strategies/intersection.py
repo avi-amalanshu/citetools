@@ -1,6 +1,9 @@
+import logging
 import networkx as nx
 from typing import Optional
 from joblib import Parallel
+
+log = logging.getLogger("citetools.strategies")
 
 
 def _grow_groups(
@@ -41,10 +44,11 @@ def _grow_groups(
     group_graphs = []
     seed_ids_per_group = []
 
-    for seeds in groups:
+    for gi, seeds in enumerate(groups):
         if not seeds:
             raise ValueError("group must be non-empty")
 
+        log.info("group %d/%d: expanding %d seed(s)", gi + 1, len(groups), len(seeds))
         gg = nx.DiGraph()
         canonical_seed_ids = set()
 
@@ -127,6 +131,7 @@ def _score(
     for gg in group_graphs:
         all_nodes.update(gg.nodes)
 
+    log.info("scoring %d candidate node(s) across %d group(s)", len(all_nodes), len(group_graphs))
     candidates = []
     for c in all_nodes:
         if c in all_seeds:
@@ -168,7 +173,8 @@ def find_bridges(
     depth: int = 2,
     n_jobs: int = 8,
     min_groups: Optional[int] = None,
-    top_k: int = 25
+    top_k: int = 25,
+    verbose: bool = False
 ) -> list[dict]:
     """
     N-way intersection strategy: find papers that bridge multiple research groups.
@@ -186,6 +192,9 @@ def find_bridges(
                     Defaults to len(groups) (true N-way intersection). Relax to
                     len(groups) - 1 to include papers in the "almost intersection" tier.
         top_k: number of bridges to return. Default 25.
+        verbose: if True, joblib prints live per-fetch progress to stderr. Coarse
+                 progress (group/seed/hop) is logged regardless via the
+                 "citetools" logger; an application attaches a handler to see it.
 
     Returns:
         list of dicts, sorted by (groups_hit desc, score asc, cited_by_count desc).
@@ -220,11 +229,18 @@ def find_bridges(
     if min_groups is None:
         min_groups = len(groups)
 
+    log.info(
+        "find_bridges: %d group(s), depth=%d, n_jobs=%d, min_groups=%d",
+        len(groups), depth, n_jobs, min_groups,
+    )
+
     # expand each group within a joblib thread pool; close client after
     try:
-        with Parallel(n_jobs=n_jobs, backend="threading") as parallel:
+        with Parallel(n_jobs=n_jobs, backend="threading", verbose=10 if verbose else 0) as parallel:
             group_graphs, seed_ids_per_group = _grow_groups(oracle, groups, depth, parallel)
-        return _score(group_graphs, seed_ids_per_group, min_groups, top_k)
+        results = _score(group_graphs, seed_ids_per_group, min_groups, top_k)
+        log.info("find_bridges: done, %d bridge(s)", len(results))
+        return results
     finally:
         oracle.client.close()
 

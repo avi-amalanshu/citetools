@@ -1,8 +1,24 @@
 import argparse
+import logging
 import sys
 import textwrap
 
 from citetools import CiteGraph, OpenAlex, find_bridges
+
+
+def _setup_logging() -> None:
+    """Attach a stderr handler to the citetools logger so progress is visible.
+
+    coarse progress (group/seed/hop) is shown by default; --verbose additionally
+    turns on joblib's live per-fetch ticking (handled inside find_bridges).
+    """
+    logger = logging.getLogger("citetools")
+    if logger.handlers:
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 # demo seeds as canonical openalex w-ids (arxiv dois are not reliably indexed):
 # "attention is all you need", the gcn paper, alphafold.
@@ -36,6 +52,8 @@ def main() -> None:
     - the "degree" field (node degree in its group graph) helps spot hub-dominated
       results; see --min-groups tuning.
     """
+    _setup_logging()
+
     parser = argparse.ArgumentParser(prog="citetools")
 
     parser.add_argument(
@@ -87,6 +105,12 @@ def main() -> None:
         action="append",
         metavar="QUERY",
         help="search works by title; print candidate W-ids and exit; repeatable",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="also stream live per-fetch progress (joblib) to stderr",
     )
 
     args = parser.parse_args()
@@ -174,6 +198,7 @@ def main() -> None:
         min_groups=min_groups,
         top_k=args.top_k,
         n_jobs=args.n_jobs,
+        verbose=args.verbose,
     )
 
     # print header

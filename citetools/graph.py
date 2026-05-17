@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import Callable, Literal
 import networkx as nx
 from .parallel import fetch_all
+
+log = logging.getLogger("citetools.graph")
 
 
 def _rank_cited_by_count(work: dict) -> float:
@@ -222,17 +225,22 @@ class CiteGraph:
         canonical_seed = self.client.key(seed)
         seed_work = self.client.work(canonical_seed)
         canonical_seed = seed_work["id"].rsplit("/", 1)[-1]  # extract bare W-id
+        log.info("grow %s: depth=%d", canonical_seed, depth)
 
         g = nx.DiGraph()
         visited: set[str] = set()
         frontier: set[str] = {canonical_seed}
 
         # BFS loop over hops
-        for _ in range(depth):
+        for hop in range(depth):
             new_frontier_sources: dict[str, str] = {}  # {node_id: "refs"|"citers"|"both"}
 
             # phase A: compute sorted frontier and fetch all neighbors concurrently
             to_expand = sorted(frontier - visited)
+            log.info(
+                "  %s hop %d/%d: fetching neighbours of %d node(s)",
+                canonical_seed, hop + 1, depth, len(to_expand),
+            )
             fetched = fetch_all(self, to_expand, parallel)
 
             # phase B: add edges and book-keep new frontier sources
@@ -265,6 +273,10 @@ class CiteGraph:
 
             # batch-fetch metadata for newly-seen nodes
             if new_frontier_sources:
+                log.info(
+                    "  %s hop %d/%d: fetching metadata for %d new node(s)",
+                    canonical_seed, hop + 1, depth, len(new_frontier_sources),
+                )
                 meta_batch = self.client.works(list(new_frontier_sources.keys()))
                 for wid, work in meta_batch.items():
                     attrs = self._extract_attrs(work)
@@ -277,6 +289,7 @@ class CiteGraph:
         # backfill metadata for bare nodes
         bare = [n for n, d in g.nodes(data=True) if "title" not in d]
         if bare:
+            log.info("  %s: backfilling metadata for %d node(s)", canonical_seed, len(bare))
             meta_batch = self.client.works(bare)
             for wid, work in meta_batch.items():
                 attrs = self._extract_attrs(work)

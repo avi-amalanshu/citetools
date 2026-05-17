@@ -92,8 +92,14 @@ each a genuine attention <-> graph-networks bridge.
 | `--n-jobs` | worker threads for concurrent fetching; 1 = serial | 8 |
 | `--resolve` | resolve an id/link to its W-id and exit; repeatable | : |
 | `--search` | search works by title; print candidate W-ids and exit; repeatable | : |
+| `-v`, `--verbose` | also stream live per-fetch progress to stderr | off |
 
 a `--depth 2` run makes many API calls and takes a few minutes; concurrency speeds this up (bounded by the ~10 req/s polite pool rate).
+
+progress is logged to stderr as the run proceeds -- which group, seed, and hop it is
+on, and how many nodes each step is fetching -- so a slow run is easy to tell from a
+stuck one. add `-v` for joblib's live per-fetch counts (`Done 16 out of 28 ...`). the
+result output on stdout is unaffected, so piping still works.
 
 ### getting a paper into `--group`
 
