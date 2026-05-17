@@ -65,7 +65,8 @@ python -m citetools --mailto you@example.com \
 ```
 
 `--group` is repeated once per research area; each takes comma-separated seed ids
-(OpenAlex W-ids, DOIs, or OpenAlex URLs). with no `--group`, a built-in demo set runs.
+(OpenAlex W-ids, DOIs, OpenAlex URLs, or arxiv abs/pdf links). with no `--group`, a
+built-in demo set runs.
 
 the run above bridges two ML areas: "Attention Is All You Need" (`W2626778328`) and
 the graph-convolutional-networks paper (`W2519887557`): and prints, among others:
@@ -89,8 +90,57 @@ each a genuine attention <-> graph-networks bridge.
 | `--top-k` | number of bridges to return | 25 |
 | `--min-groups` | how many groups a candidate must reach to qualify | all groups |
 | `--n-jobs` | worker threads for concurrent fetching; 1 = serial | 8 |
+| `--resolve` | resolve an id/link to its W-id and exit; repeatable | : |
+| `--search` | search works by title; print candidate W-ids and exit; repeatable | : |
 
 a `--depth 2` run makes many API calls and takes a few minutes; concurrency speeds this up (bounded by the ~10 req/s polite pool rate).
+
+### getting a paper into `--group`
+
+`--group` accepts the following ID forms:
+- an OpenAlex W-id
+- a DOI (`doi:10.xxxx/yyyy`)
+- an OpenAlex URL
+- arxiv abs/pdf link 
+
+Most of the time you just paste the link:
+
+```
+python -m citetools --mailto you@example.com \
+    --group https://arxiv.org/abs/2010.11929 \
+    --group W2519887557
+```
+
+arxiv links resolve via the arxiv doi `10.48550/arxiv.<id>`. That works only when
+OpenAlex has the paper registered under that doi: reliable for recent papers,
+patchier for older arxiv-only ones. When a link can't be resolved the run fails
+loudly with a clear error rather than guessing a wrong match.
+
+If that happens (or if you only know a title), find the W-id by title with
+`--search`, then pass the W-id you pick:
+
+```
+# step 1: find the paper
+python -m citetools --mailto you@example.com \
+    --search "relational inductive biases deep learning graph networks"
+#   -> W2805516822  2018  cites=2401  Relational inductive biases, deep learning, ...
+
+# step 2: run the finder with the W-id from step 1
+python -m citetools --mailto you@example.com \
+    --group W2805516822 --group W2519887557
+```
+
+`--search` prints the top title-match candidates (`W-id  year  cites  title`); you
+pick the right one by eye. `--resolve` is the converse: it takes one id/link and
+prints the single W-id it maps to, handy to confirm a link before a long run:
+
+```
+python -m citetools --mailto you@example.com --resolve https://arxiv.org/abs/2010.11929
+```
+
+both `--search` and `--resolve` are repeatable and short-circuit the run: they print
+and exit, never touching the finder (no `--group` needed). if both are passed,
+`--search` runs.
 
 ### Library
 
