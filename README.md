@@ -231,10 +231,11 @@ So raising `--frontier-cap` widens `bidir`'s *arbitrary* slice; raising `--cap` 
 
 ### Progress logging
 
-Both strategies log coarse progress to stderr as the run proceeds, so a slow run is
+Each strategy logs coarse progress to stderr as the run proceeds, so a slow run is
 easy to tell from a stuck one. The result output on stdout is unaffected, so piping
 still works. Add `-v` / `--verbose` for joblib's live per-fetch counts on top
-(`Done 16 out of 28 | elapsed: ...`).
+(`Done 16 out of 28 | elapsed: ...`), plus a `fetched <W-id>` line as each node's
+neighbours arrive (`bidir` and `walk`).
 
 **`intersection`** logs the group it is on, then each seed's breadth-first growth hop
 by hop (neighbour fetches, then metadata fetches), then the scoring pass:
@@ -279,6 +280,27 @@ bidir n-way: 3 groups, 3 pairs, mode=budget, max_depth=2
   round 3: 2 live engine(s), fetching 437 node(s)
 bidir n-way: done, 1 candidate(s)
 ```
+
+**`walk`** logs its run plan, then each ensemble run's hops. With `--ensemble` the
+runs execute concurrently, so their log lines interleave — the `run N` prefix tells
+them apart:
+
+```
+walk: 2 group(s), 1 pairs, ensemble=True (M=3), depth=4
+walk: driving 3 run(s), 2 i/o thread(s)/run
+  run 0 hop 1: 1 live engine(s), 1 frontier node(s), 1 title(s) fetched
+  run 2 hop 1: 1 live engine(s), 1 frontier node(s), 1 title(s) fetched
+  run 1 hop 1: 1 live engine(s), 1 frontier node(s), 1 title(s) fetched
+  run 0 hop 1: fetching 1 kept frontier node(s)
+  run 2 hop 1: fetching 1 kept frontier node(s)
+  run 0 hop 2: 1 live engine(s), 92 frontier node(s), 92 title(s) fetched
+  ...
+walk: done, 25 bridge(s)
+```
+
+Without `--ensemble` it is a single run (`run 0`) and the lines stay ordered. `walk`
+logs one extra figure per hop — `title(s) fetched` — because it fetches and embeds
+frontier titles *before* pruning, to steer the prune.
 
 (Counts above are illustrative.) `degree` prints as `0` for `bidir` results — it is
 an `intersection`-only field.
@@ -406,18 +428,34 @@ Supporting files: `citetools/errors.py` (`OpenAlexError` / `BadId`),
 
 ## Concurrency
 
-Both strategies parallelize I/O *within* a search step: all of a step's frontier
-nodes' neighbour lists are fetched concurrently over a thread pool (`--n-jobs`,
-default 8). The steps themselves remain sequential.
+**I/O within a step (every strategy).** Each strategy parallelizes the I/O of a search
+step: that step's frontier nodes have their neighbour lists fetched concurrently over
+a thread pool (`--n-jobs`, default 8). The steps themselves stay sequential — each one
+needs the previous step's results.
 
-A shared rate limiter keeps the aggregate request rate within the OpenAlex polite
-pool's ceiling (~10 req/s) regardless of thread count. Concurrency hides per-request
-latency, not request volume: it reclaims the rate budget that serial execution leaves
-idle while stalling on latency, and cannot exceed the polite-pool cap.
+**Ensemble runs in parallel (`walk`).** `walk --ensemble` adds a second axis of
+concurrency: its `M` stochastic runs are independent, so each is driven on its own
+thread. The `--n-jobs` budget is split across them — `max(1, n_jobs // M)` I/O threads
+per run — keeping the total near `--n-jobs`. The runs share one OpenAlex client, hence
+one cache (a paper fetched by one run is free for the rest) and one rate limiter. A
+single `walk` run (no `--ensemble`) is unaffected: one run, the full `--n-jobs`.
 
-Output is deterministic and independent of `--n-jobs`: results with `--n-jobs 8` are
-identical to `--n-jobs 1`, thanks to fixed total-order tie-breaks in ranking and a
-pure-CPU search core whose decisions never depend on fetch timing.
+**Shared rate limiter.** One rate limiter, shared across every thread — and, for
+`walk`, every run — holds the aggregate request rate within the OpenAlex polite pool's
+ceiling (~10 req/s), regardless of thread count. When OpenAlex rate-limits a request
+(HTTP 429) it applies a brief *fleet-wide* cooldown — all threads back off together —
+then retries, so a busy server degrades gracefully rather than stalling silently.
+Concurrency hides per-request latency, not request volume: it reclaims the rate budget
+a serial run leaves idle while stalling on latency, and cannot exceed the polite-pool
+cap.
+
+**Determinism.** `intersection`, `bidir`, and `walk` without `--ensemble` are
+deterministic and independent of `--n-jobs`: a `--n-jobs 8` result equals a
+`--n-jobs 1` result, thanks to fixed total-order tie-breaks in ranking and a pure-CPU
+search core whose decisions never depend on fetch timing. A `walk --ensemble` run is
+deterministic only with `--seed`: each run draws its own RNG spawned from that seed,
+so the outcome is fixed however the run threads interleave; without `--seed` the
+ensemble is genuinely random.
 
 ## Limitations
 
