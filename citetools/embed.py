@@ -1,5 +1,7 @@
 """lazy offline embedding of paper titles with batched inference and cache."""
 
+import threading
+
 import numpy
 
 
@@ -13,6 +15,9 @@ class TitleEmbedder:
       embed() partitions items into cache hits/misses, batch-encodes misses,
              stores results, returns all from cache
       dim property triggers load and returns embedding dimension
+
+    thread-safety: embed() and dim hold an internal lock, so one embedder is
+    safe to share across the concurrent ensemble-run threads in walk.py.
     """
 
     def __init__(
@@ -36,6 +41,7 @@ class TitleEmbedder:
         self.device = device
         self._cache = {}
         self._model = None
+        self._lock = threading.Lock()
 
     def _load(self) -> None:
         """
@@ -79,33 +85,36 @@ class TitleEmbedder:
         if not items:
             return {}
 
-        self._load()
+        # lock guards the lazy _load() and the encode/cache-write path so the
+        # embedder is safe under concurrent calls from walk.py's run threads.
+        with self._lock:
+            self._load()
 
-        # partition into hits and misses
-        hits = {wid: self._cache[wid] for wid in items if wid in self._cache}
-        misses = {wid: items[wid] for wid in items if wid not in self._cache}
+            # partition into hits and misses
+            hits = {wid: self._cache[wid] for wid in items if wid in self._cache}
+            misses = {wid: items[wid] for wid in items if wid not in self._cache}
 
-        if not misses:
-            return hits
+            if not misses:
+                return hits
 
-        # deterministic order for batching
-        sorted_wids = sorted(misses.keys())
-        titles = [misses[wid] for wid in sorted_wids]
+            # deterministic order for batching
+            sorted_wids = sorted(misses.keys())
+            titles = [misses[wid] for wid in sorted_wids]
 
-        # batch encode all misses with L2 normalization
-        vectors = self._model.encode(
-            titles,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        )
+            # batch encode all misses with L2 normalization
+            vectors = self._model.encode(
+                titles,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
 
-        # store in cache
-        for wid, vec in zip(sorted_wids, vectors):
-            self._cache[wid] = vec
+            # store in cache
+            for wid, vec in zip(sorted_wids, vectors):
+                self._cache[wid] = vec
 
-        # return all from cache in input order
-        return {wid: self._cache[wid] for wid in items}
+            # return all from cache in input order
+            return {wid: self._cache[wid] for wid in items}
 
     @property
     def dim(self) -> int:
@@ -113,8 +122,9 @@ class TitleEmbedder:
         Embedding dimension (int). Queries the model via get_sentence_embedding_dimension().
         Triggers model load if not yet loaded.
         """
-        self._load()
-        return self._model.get_sentence_embedding_dimension()
+        with self._lock:
+            self._load()
+            return self._model.get_sentence_embedding_dimension()
 
 
 def sim_to_set(vec: numpy.ndarray, targets: numpy.ndarray, agg: str = "max") -> float:

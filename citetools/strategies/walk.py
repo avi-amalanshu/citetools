@@ -6,7 +6,7 @@ import itertools
 import logging
 
 import numpy as np
-from joblib import Parallel
+from joblib import Parallel, delayed
 
 from .bidir import BiDirEngine, StepIn
 from ..parallel import fetch_all
@@ -67,7 +67,9 @@ def find_bridges_walk(
 	         Range [0,1]; 1.0=pure-structural, 0.0=pure-semantic.
 	  seed: numpy random seed for ensemble; None = system-seeded.
 	  embedder: TitleEmbedder instance. If None, builds a new one (lazy model load).
-	  n_jobs: number of threads for parallel fetch_all. Default 8.
+	  n_jobs: total I/O thread budget. With an M-run ensemble it is split
+	          max(1, n_jobs // M) per run; each run also gets one driver thread.
+	          Default 8.
 	  verbose: if True, joblib prints per-fetch progress to stderr. Default False.
 
 	Returns:
@@ -160,8 +162,22 @@ def find_bridges_walk(
 					seed_emb,
 				)
 
-		# drive all engines
-		_drive(oracle, engines, deterministic, cap, p, T, embedder, n_jobs, verbose)
+		# drive the ensemble: one thread per run, all sharing the oracle, its
+		# client cache + rate-limiter, and the embedder. the i/o thread budget
+		# is split across runs so the total stays near n_jobs.
+		runs_engines = {r: {} for r in range(runs)}
+		for tag, val in engines.items():
+			runs_engines[tag[0]][tag] = val
+		inner_jobs = max(1, n_jobs // runs)
+		log.info("walk: driving %d run(s), %d i/o thread(s)/run", runs, inner_jobs)
+		with Parallel(n_jobs=runs, backend="threading") as outer:
+			outer(
+				delayed(_drive_run)(
+					oracle, runs_engines[r], deterministic, cap, p, T,
+					embedder, inner_jobs, verbose, r
+				)
+				for r in range(runs)
+			)
 
 		# aggregate: min_dist[node][group_idx], recur[node]
 		per_run = {}  # {run_idx: {group_idx: {node: dist}}}
@@ -229,7 +245,7 @@ def find_bridges_walk(
 		oracle.client.close()
 
 
-def _drive(
+def _drive_run(
     oracle,
     engines: dict,
     deterministic: bool,
@@ -239,8 +255,9 @@ def _drive(
     embedder: TitleEmbedder,
     n_jobs: int,
     verbose: bool,
+    run_idx: int,
 ) -> None:
-	"""round-robin drive all engines in lockstep with embedding prune.
+	"""round-robin drive one ensemble run's engines in lockstep with embedding prune.
 
 	mirrors find_bridges_bidir_nway's loop, inserting the embedding-guided prune
 	between frontier emission and fetch_all. the prune operates per-engine,
@@ -259,15 +276,16 @@ def _drive(
 
 	Args:
 	  oracle: CiteGraph with oracle.client.works.
-	  engines: {(run_idx, i, j): (BiDirEngine, rng, seed_emb)}.
+	  engines: {(run_idx, i, j): (BiDirEngine, rng, seed_emb)} for ONE ensemble run.
 	  deterministic: if True, _keep uses deterministic top-cap; if False,
 	    stochastic Bernoulli prune. the caller sets this to (not ensemble).
 	  cap: frontier cap per engine per round.
 	  p: floor probability for Bernoulli.
 	  T: temperature for sigmoid.
 	  embedder: TitleEmbedder for embedding frontier nodes.
-	  n_jobs: joblib thread count.
+	  n_jobs: joblib thread count for this run's fetch_all pool.
 	  verbose: if True, joblib prints per-fetch progress.
+	  run_idx: ensemble run index, used to prefix log lines.
 	"""
 	# prime: advance each engine with empty nbrs
 	live = {}  # {tag: (engine, rng, seed_emb, step)}
@@ -290,8 +308,8 @@ def _drive(
 				node_embs = embedder.embed(titles)
 			else:
 				node_embs = {}
-			log.info("  hop %d: %d live engine(s), %d frontier node(s), %d title(s) fetched",
-					 hop, len(live), len(raw), len(works) if raw else 0)
+			log.info("  run %d hop %d: %d live engine(s), %d frontier node(s), %d title(s) fetched",
+					 run_idx, hop, len(live), len(raw), len(works) if raw else 0)
 
 			# phase 2: prune per engine
 			kept = {}  # {tag: set of kept frontier nodes}
@@ -312,8 +330,8 @@ def _drive(
 			# phase 3: batch fetch union of kept frontiers
 			union_kept = sorted(set().union(*kept.values()))
 			if union_kept:
-				nbrs = fetch_all(oracle, union_kept, parallel)
-				log.info("  hop %d: fetching %d kept frontier node(s)", hop, len(union_kept))
+				nbrs = fetch_all(oracle, union_kept, parallel, progress=verbose)
+				log.info("  run %d hop %d: fetching %d kept frontier node(s)", run_idx, hop, len(union_kept))
 			else:
 				nbrs = {}
 
@@ -326,8 +344,8 @@ def _drive(
 					next_live[tag] = (engine, rng, seed_emb, nxt)
 
 			live = next_live
-			log.info("  hop %d: %d meeting node(s) across all engines so far",
-					 hop, sum(len(e._meeting) for e, _, _, _ in live.values()) if live else 0)
+			log.info("  run %d hop %d: %d meeting node(s) so far",
+					 run_idx, hop, sum(len(e._meeting) for e, _, _, _ in live.values()) if live else 0)
 
 
 def _keep(

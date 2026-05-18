@@ -125,8 +125,13 @@ class CiteGraph:
           This thread-safety property also holds under the bidirectional N-way
           aggregator (strategies/bidir.py): the aggregator performs round-level
           union-dedup of all pair frontiers before each concurrent fetch_all batch,
-          guaranteeing distinct nodes within each batch. No two threads call
-          nbrs(same_node) concurrently in that usage either.
+          guaranteeing distinct nodes within each batch.
+
+          The walk strategy's per-run threads (strategies/walk.py) may, by
+          contrast, call nbrs(same_node) concurrently across runs. That is still
+          safe: a cache miss is idempotent (both threads compute equal results,
+          and per-key dict writes are GIL-atomic); the only cost is a redundant
+          fetch, which the shared OpenAlex caches and rate-limiter absorb.
         """
         if node in self._nbrs_cache:
             return self._nbrs_cache[node]
