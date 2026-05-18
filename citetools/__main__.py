@@ -3,7 +3,7 @@ import logging
 import sys
 import textwrap
 
-from citetools import CiteGraph, OpenAlex, find_bridges, find_bridges_bidir, find_bridges_bidir_nway, find_bridges_walk
+from citetools import CiteGraph, OpenAlex, find_bridges, find_bridges_bidir, find_bridges_bidir_nway, find_bridges_walk, find_bridges_refine
 
 
 def _setup_logging() -> None:
@@ -115,9 +115,9 @@ def main() -> None:
     parser.add_argument(
         "--strategy",
         type=str,
-        choices=["intersection", "bidir", "walk"],
+        choices=["intersection", "bidir", "walk", "refine"],
         default="intersection",
-        help="bridging strategy: 'intersection' (default), 'bidir' (bidirectional), or 'walk' (semantic-ensemble)",
+        help="bridging strategy: 'intersection' (default), 'bidir' (bidirectional), 'walk' (semantic-ensemble), or 'refine' (iterative refinement heuristic over walk)",
     )
     parser.add_argument(
         "--mode",
@@ -180,6 +180,12 @@ def main() -> None:
         help="walk: per-hop per-engine frontier cap; the embedding prune keeps "
         "the top --cap most-promising nodes -- raise it to widen the search "
         "(default 60)",
+    )
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=3,
+        help="refine: number of refinement rounds (each round runs the pairwise search; round 1 is the original groups) (default 3)",
     )
 
     args = parser.parse_args()
@@ -256,6 +262,11 @@ def main() -> None:
         if not (0 <= args.alpha <= 1):
             raise ValueError(f"alpha must be in [0, 1]; got {args.alpha}")
 
+    # refine-specific validation
+    if args.strategy == "refine":
+        if args.iters < 1:
+            raise ValueError("iters must be >= 1")
+
     # handle groups: parse or use demo
     if args.group is None:
         groups = DEMO_GROUPS
@@ -276,6 +287,9 @@ def main() -> None:
     if args.strategy == "bidir":
         if len(groups) == 1:
             raise ValueError("bidir strategy requires >= 2 groups; got 1")
+    if args.strategy == "refine":
+        if len(groups) < 3:
+            raise ValueError("refine strategy requires >= 3 groups")
 
     # finalize min_groups
     if args.min_groups is None:
@@ -342,11 +356,26 @@ def main() -> None:
             n_jobs=args.n_jobs,
             verbose=args.verbose,
         )
+    elif args.strategy == "refine":
+        results = find_bridges_refine(
+            oracle=oracle,
+            groups=groups,
+            depth=args.depth,
+            iters=args.iters,
+            top_k=args.top_k,
+            min_groups=min_groups,
+            cap=args.cap,
+            embedder=None,
+            n_jobs=args.n_jobs,
+            verbose=args.verbose,
+        )
 
     # print header
     strategy_info = f"Strategy: {args.strategy}"
     if args.strategy == "bidir":
         strategy_info += f", Mode: {args.mode}, Frontier-cap: {args.frontier_cap}"
+    if args.strategy == "refine":
+        strategy_info += f", Iters: {args.iters}"
 
     msg = textwrap.dedent(
         f"""\
