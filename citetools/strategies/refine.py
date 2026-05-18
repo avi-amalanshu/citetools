@@ -242,6 +242,11 @@ def find_bridges_refine(
 	top_k: int = 25,
 	min_groups: int | None = None,
 	cap: int = 60,
+	ensemble: bool = False,
+	M: int = 5,
+	p: float = 0.15,
+	T: float = 0.1,
+	seed: int | None = None,
 	embedder: TitleEmbedder | None = None,
 	n_jobs: int = 8,
 	verbose: bool = False,
@@ -260,7 +265,8 @@ def find_bridges_refine(
 	  4. init current = canon (list of sets), owned by the caller for iteration.
 	  5. iteration loop (up to iters rounds):
 	     - if fewer than 2 current groups remain, break.
-	     - run _run_pairs on current groups (want_paths=True, deterministic, 1 run).
+	     - run _run_pairs on current groups (want_paths=True; 1 deterministic run,
+	       or M stochastic-prune runs if ensemble), merging all runs' paths.
 	     - extract paths via reconstruct_paths per engine.
 	     - relax D with path distances.
 	     - check for full N-group coverage; if found, emit and return.
@@ -278,6 +284,11 @@ def find_bridges_refine(
 	  top_k: result size (number of bridges to return). default 25. must be >= 1.
 	  min_groups: min groups a candidate must bridge. default N (len(groups)).
 	  cap: frontier cap per pairwise engine per round. default 60. must be > 0.
+	  ensemble: if True, run M stochastic-prune runs per round; else 1 deterministic run.
+	  M: ensemble size (runs per round). default 5. must be >= 1. used only if ensemble.
+	  p: floor reserve probability for the stochastic prune. default 0.15. must be 0 < p < 1.
+	  T: temperature for the stochastic prune sigmoid. default 0.1. must be > 0.
+	  seed: rng master seed for the ensemble (per-round seed = seed + round). None = unseeded.
 	  embedder: TitleEmbedder instance or None (lazy-build one).
 	  n_jobs: i/o thread budget. default 8. must be > 0.
 	  verbose: if True, joblib prints per-fetch progress.
@@ -288,7 +299,8 @@ def find_bridges_refine(
 	  doi, cited_by_count (as per _score output).
 
 	raises ValueError if: groups empty, any group empty, N < 3, depth < 1,
-	                       iters < 1, top_k < 1, min_groups < 1, cap < 1.
+	                       iters < 1, top_k < 1, min_groups < 1, cap < 1,
+	                       not (0 < p < 1), T <= 0, or M < 1.
 	"""
 	# validation
 	if not groups:
@@ -307,6 +319,12 @@ def find_bridges_refine(
 		raise ValueError("top_k must be >= 1")
 	if cap < 1:
 		raise ValueError("cap must be > 0")
+	if not (0 < p < 1):
+		raise ValueError("p must be in (0, 1); 0 < p < 1")
+	if T <= 0:
+		raise ValueError("T must be > 0")
+	if M < 1:
+		raise ValueError("M must be >= 1")
 	if min_groups is None:
 		min_groups = N
 	if min_groups < 1:
@@ -336,7 +354,12 @@ def find_bridges_refine(
 	# current list of sets for iteration
 	current = [set(g) for g in canon]
 
-	log.info("refine: %d group(s), %d iter(s), depth=%d", N, iters, depth)
+	# ensemble config: M stochastic-prune runs per round, or 1 deterministic run.
+	runs = M if ensemble else 1
+	deterministic = not ensemble
+
+	log.info("refine: %d group(s), %d iter(s), depth=%d, ensemble=%s (runs=%d)",
+	         N, iters, depth, ensemble, runs)
 
 	try:
 		for r in range(iters):
@@ -350,20 +373,25 @@ def find_bridges_refine(
 				depth=depth,
 				frontier_cap=None,
 				want_paths=True,
-				runs=1,
-				deterministic=True,
+				runs=runs,
+				deterministic=deterministic,
 				cap=cap,
-				p=0.15,
-				T=0.1,
+				p=p,
+				T=T,
 				embedder=embedder,
 				n_jobs=n_jobs,
 				verbose=verbose,
-				seed=None
+				seed=(None if seed is None else seed + r),
 			)
 
-			# extract pairs and paths
-			pairs = sorted(set((i, j) for (_, i, j) in engines.keys()))
-			paths_by_pair = {(i, j): reconstruct_paths(engines[(0, i, j)]) for (i, j) in pairs}
+			# reconstruct paths; merge all ensemble runs per pair, keyed by
+			# (run_idx, meeting node) so two runs meeting at the same node both
+			# survive -- relax is min-monotone, so the merge is order-independent.
+			pairs = sorted({(i, j) for (_, i, j) in engines})
+			paths_by_pair = {pr: {} for pr in pairs}
+			for (run_idx, i, j), eng in engines.items():
+				for mn, pd in reconstruct_paths(eng).items():
+					paths_by_pair[(i, j)][(run_idx, mn)] = pd
 			log.info("refine: round %d, %d pair(s), %d paths total", r, len(pairs), sum(len(p) for p in paths_by_pair.values()))
 
 			# distance relaxation

@@ -138,28 +138,28 @@ def main() -> None:
         "--ensemble",
         action="store_true",
         default=False,
-        help="walk: run a randomized ensemble (default: single deterministic run)",
+        help="walk/refine: run a randomized ensemble (default: single deterministic run)",
     )
     parser.add_argument(
         "-M",
         "--ensemble-runs",
         type=int,
         default=5,
-        help="walk: number of ensemble runs (default 5; used only with --ensemble)",
+        help="walk/refine: number of ensemble runs (default 5; used only with --ensemble)",
     )
     parser.add_argument(
         "-p",
         "--floor-prob",
         type=float,
         default=0.15,
-        help="walk: floor reserve probability for stochastic pruning (default 0.15)",
+        help="walk/refine: floor reserve probability for stochastic pruning (default 0.15)",
     )
     parser.add_argument(
         "-T",
         "--temperature",
         type=float,
         default=0.1,
-        help="walk: pruning sigmoid temperature (default 0.1)",
+        help="walk/refine: pruning sigmoid temperature (default 0.1)",
     )
     parser.add_argument(
         "--alpha",
@@ -171,7 +171,7 @@ def main() -> None:
         "--seed",
         type=int,
         default=None,
-        help="walk: RNG master seed for reproducibility (default: unseeded)",
+        help="walk/refine: RNG master seed for reproducibility (default: unseeded)",
     )
     parser.add_argument(
         "--cap",
@@ -266,6 +266,12 @@ def main() -> None:
     if args.strategy == "refine":
         if args.iters < 1:
             raise ValueError("iters must be >= 1")
+        if not (0 < args.floor_prob < 1):
+            raise ValueError(f"floor-prob must be in (0, 1); got {args.floor_prob}")
+        if args.temperature <= 0:
+            raise ValueError(f"temperature must be > 0; got {args.temperature}")
+        if args.ensemble_runs < 1:
+            raise ValueError(f"ensemble-runs must be >= 1; got {args.ensemble_runs}")
 
     # handle groups: parse or use demo
     if args.group is None:
@@ -365,6 +371,11 @@ def main() -> None:
             top_k=args.top_k,
             min_groups=min_groups,
             cap=args.cap,
+            ensemble=args.ensemble,
+            M=args.ensemble_runs,
+            p=args.floor_prob,
+            T=args.temperature,
+            seed=args.seed,
             embedder=None,
             n_jobs=args.n_jobs,
             verbose=args.verbose,
