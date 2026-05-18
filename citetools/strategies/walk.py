@@ -17,6 +17,103 @@ log = logging.getLogger("citetools.strategies")
 __all__ = ["find_bridges_walk"]
 
 
+def _seed_emb(oracle, canon, embedder) -> dict[int, dict[str, np.ndarray]]:
+	"""precompute seed-group title embeddings.
+
+	plan: seed_wids = sorted union of all seeds across all groups;
+	  seed_titles = fetch titles from oracle.client.work;
+	  seed_vecs = embed titles;
+	  return {group_idx: {seed_wid: embedding_vec}} for each group.
+
+	Args:
+	  oracle: CiteGraph with oracle.client.work.
+	  canon: list[set[str]] canonical seed sets, indexed by group.
+	  embedder: TitleEmbedder instance.
+
+	Returns:
+	  {group_idx: {seed_wid: (dim,) numpy.ndarray embedding}}.
+	"""
+	seed_wids = sorted(set().union(*canon))
+	seed_titles = {
+		w: (oracle.client.work(w).get("title") or "") for w in seed_wids
+	}
+	seed_vecs = embedder.embed(seed_titles)
+	return {gi: {w: seed_vecs[w] for w in g if w in seed_vecs} for gi, g in enumerate(canon)}
+
+
+def _run_pairs(oracle, canon, seed_emb, *, depth, frontier_cap, want_paths, runs, deterministic, cap, p, T, embedder, n_jobs, verbose, seed) -> dict[tuple[int, int, int], BiDirEngine]:
+	"""spawn engines per run and pair, drive ensemble, return bare engines.
+
+	plan: spawn per-run RNGs from seed; build
+	  {(run_idx, i, j): (BiDirEngine(...), rng, seed_emb)} over all runs and
+	  itertools.combinations(range(len(canon)), 2); organize into runs_engines
+	  by run_idx; split i/o budget as inner_jobs = max(1, n_jobs // runs);
+	  drive all runs in parallel with Parallel(n_jobs=runs, backend="threading")
+	  calling _drive_run; after completion, extract and return
+	  {(run_idx, i, j): BiDirEngine} (engine objects only, no tuples).
+
+	Args:
+	  oracle: CiteGraph with oracle.client.
+	  canon: list[set[str]] canonical seed sets.
+	  seed_emb: {group_idx: {seed_wid: embedding}} from _seed_emb.
+	  depth: max hop depth per engine.
+	  frontier_cap: frontier cap for BiDirEngine; None = uncapped.
+	  want_paths: if True, BiDirEngine records paths; if False, None.
+	  runs: number of ensemble runs.
+	  deterministic: if True, _keep uses top-cap; if False, Bernoulli prune.
+	  cap: frontier cap per engine per round (for _keep).
+	  p: floor probability for Bernoulli.
+	  T: temperature for sigmoid.
+	  embedder: TitleEmbedder instance.
+	  n_jobs: total i/o thread budget.
+	  verbose: if True, joblib prints progress.
+	  seed: numpy random seed or None.
+
+	Returns:
+	  {(run_idx, i, j): BiDirEngine} driven engines only.
+
+	Note: does NOT call oracle.client.close().
+	"""
+	N = len(canon)
+
+	# spawn per-run RNGs
+	if seed is not None:
+		ss = np.random.SeedSequence(seed)
+		seeds = ss.spawn(runs)
+		rngs = [np.random.default_rng(s) for s in seeds]
+	else:
+		rngs = [np.random.default_rng() for _ in range(runs)]
+
+	# build engines: one per (run_idx, i, j) pair
+	engines = {}
+	pairs = list(itertools.combinations(range(N), 2))
+	for run_idx in range(runs):
+		for i, j in pairs:
+			tag = (run_idx, i, j)
+			engines[tag] = (
+				BiDirEngine(canon[i], canon[j], mode="budget", max_depth=depth, frontier_cap=frontier_cap, want_paths=want_paths),
+				rngs[run_idx],
+				seed_emb,
+			)
+
+	# organize by run and drive in parallel
+	runs_engines = {r: {} for r in range(runs)}
+	for tag, val in engines.items():
+		runs_engines[tag[0]][tag] = val
+	inner_jobs = max(1, n_jobs // runs)
+	with Parallel(n_jobs=runs, backend="threading") as outer:
+		outer(
+			delayed(_drive_run)(
+				oracle, runs_engines[r], deterministic, cap, p, T,
+				embedder, inner_jobs, verbose, r
+			)
+			for r in range(runs)
+		)
+
+	# extract bare engines
+	return {tag: engine for tag, (engine, _, _) in engines.items()}
+
+
 def find_bridges_walk(
     oracle,
     groups: list[list[str]],
@@ -134,59 +231,24 @@ def find_bridges_walk(
 
 	try:
 		# precompute seed-title embeddings, indexed by group.
-		# work() resolves any id form (w-id, doi, arxiv) -- works() skips
-		# doi: keys, so per-seed work() calls are used (seeds are few).
-		seed_wids = sorted(set().union(*canon))
-		seed_titles = {
-			w: (oracle.client.work(w).get("title") or "") for w in seed_wids
-		}
-		seed_vecs = embedder.embed(seed_titles)
-		seed_emb = {gi: {w: seed_vecs[w] for w in g if w in seed_vecs} for gi, g in enumerate(canon)}
+		seed_emb = _seed_emb(oracle, canon, embedder)
 
-		# spawn runs with seeded RNGs
-		if seed is not None:
-			ss = np.random.SeedSequence(seed)
-			seeds = ss.spawn(runs)
-			rngs = [np.random.default_rng(s) for s in seeds]
-		else:
-			rngs = [np.random.default_rng() for _ in range(runs)]
-
-		# build engines: one per (run_idx, i, j) pair. frontier_cap=None leaves the
-		# engine uncapped -- walk's _keep is the sole, embedding-guided frontier prune.
-		engines = {}
-		pairs = list(itertools.combinations(range(N), 2))
-		for run_idx in range(runs):
-			for i, j in pairs:
-				tag = (run_idx, i, j)
-				engines[tag] = (
-					BiDirEngine(canon[i], canon[j], mode="budget", max_depth=depth, frontier_cap=None),
-					rngs[run_idx],
-					seed_emb,
-				)
-
-		# drive the ensemble: one thread per run, all sharing the oracle, its
-		# client cache + rate-limiter, and the embedder. the i/o thread budget
-		# is split across runs so the total stays near n_jobs.
-		runs_engines = {r: {} for r in range(runs)}
-		for tag, val in engines.items():
-			runs_engines[tag[0]][tag] = val
-		inner_jobs = max(1, n_jobs // runs)
-		log.info("walk: driving %d run(s), %d i/o thread(s)/run", runs, inner_jobs)
-		with Parallel(n_jobs=runs, backend="threading") as outer:
-			outer(
-				delayed(_drive_run)(
-					oracle, runs_engines[r], deterministic, cap, p, T,
-					embedder, inner_jobs, verbose, r
-				)
-				for r in range(runs)
-			)
+		# build and drive engines per run via embedding-guided frontier prune.
+		# frontier_cap=None leaves the engine uncapped -- walk's _keep is the sole,
+		# embedding-guided frontier prune.
+		log.info("walk: driving %d run(s), %d i/o thread(s)/run", runs, max(1, n_jobs // runs))
+		engines = _run_pairs(
+			oracle, canon, seed_emb, depth=depth, frontier_cap=None,
+			want_paths=False, runs=runs, deterministic=deterministic, cap=cap,
+			p=p, T=T, embedder=embedder, n_jobs=n_jobs, verbose=verbose, seed=seed
+		)
 
 		# aggregate: min_dist[node][group_idx], recur[node]
 		per_run = {}  # {run_idx: {group_idx: {node: dist}}}
 		for run_idx in range(runs):
 			per_run[run_idx] = {gi: {} for gi in range(N)}
 
-		for (run_idx, i, j), (engine, _, _) in engines.items():
+		for (run_idx, i, j), engine in engines.items():
 			for node, d in engine._meeting.items():
 				per_run[run_idx][i][node] = min(per_run[run_idx][i].get(node, float("inf")), d["a"])
 				per_run[run_idx][j][node] = min(per_run[run_idx][j].get(node, float("inf")), d["b"])
