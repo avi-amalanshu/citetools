@@ -173,6 +173,14 @@ def main() -> None:
         default=None,
         help="walk: RNG master seed for reproducibility (default: unseeded)",
     )
+    parser.add_argument(
+        "--cap",
+        type=int,
+        default=60,
+        help="walk: per-hop per-engine frontier cap; the embedding prune keeps "
+        "the top --cap most-promising nodes -- raise it to widen the search "
+        "(default 60)",
+    )
 
     args = parser.parse_args()
 
@@ -324,6 +332,7 @@ def main() -> None:
             depth=args.depth,
             min_groups=min_groups,
             top_k=args.top_k,
+            cap=args.cap,
             ensemble=args.ensemble,
             M=args.ensemble_runs,
             p=args.floor_prob,

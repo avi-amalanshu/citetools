@@ -18,12 +18,19 @@ reach you if your script misbehaves (their "polite pool").
 treat it as an exploratory / hypothesis-generation tool: the output is candidates to
 inspect, not ground truth. see [limitations](#limitations).
 
-## Two strategies
+## Strategies
 
-citetools ships two interchangeable bridge-finding strategies. They take the same
-input (N groups of seed papers) and return the same kind of ranked list of bridge
-papers; they differ in *how* they walk the citation graph. Pick one with
-`--strategy` on the CLI, or call the matching function from the library.
+citetools ships two interchangeable *core* strategies — `intersection` and `bidir` —
+plus `walk`, a **cousin** of `bidir`. All take the same input (N groups of seed
+papers) and return a ranked list of bridge papers; they differ in *how* they walk the
+citation graph, and `walk` also differs in *how it ranks*. Pick one with `--strategy`
+on the CLI, or call the matching function from the library.
+
+`intersection` and `bidir` are interchangeable peers — same scoring, same
+dependencies. `walk` is a *cousin*, not a drop-in sibling: it is built on top of
+`bidir`'s search engine, but adds an optional local-embedding dependency, a semantic
+ranking, and randomised ensembling. A more experimental tool, with its own
+philosophy (see [`walk`](#walk--semantic-ensemble) below).
 
 ### `intersection` — exhaustive
 
@@ -54,6 +61,31 @@ computing a true intersection (a paper can rank well by bridging several pairs w
 being central to all groups at once). N>=3 results also carry a `recurrence` field:
 how many group-pairs the paper bridged, a diagnostic.
 
+### `walk` — semantic-ensemble
+
+A **cousin of `bidir`**: `walk` reuses `bidir`'s meet-in-the-middle engine, but
+replaces its *blunt* frontier cap with a *smart* one. At each step `bidir` keeps an
+arbitrary slice of the frontier; `walk` keeps the `--cap` papers whose **titles** are
+most semantically similar (local sentence-transformer embedding, cosine) to the group
+it is steering toward. The compute budget is spent on papers heading *toward* a
+bridge rather than on an arbitrary slice — so the search can be pushed deeper for the
+same budget. On top of that, `walk`:
+
+- **fuses** the structural distance with title-embedding similarity into the final
+  `score` (weight `--alpha`; `1.0` = pure structural, `0.0` = pure semantic), so the
+  ranking reflects *conceptual* proximity, not just citation-hop proximity. It also
+  drops `cited_by_count` from the ranking — `walk` deliberately avoids the hub bias.
+- runs an optional **ensemble** (`--ensemble`, `-M` stochastic runs): each run prunes
+  the frontier randomly — biased by the embedding signal, with a floor keep-probability
+  (`-p`) so every paper keeps a chance. Per-group distances are aggregated as the
+  *minimum over runs*; a `recurrence` field counts how many runs found the bridge.
+
+`walk` needs an optional dependency — a local embedding model (see
+[Environment setup](#environment-setup)); it never sends paper data off-machine. It
+is **experimental**: on closely-related groups it surfaces sensible bridges, but on
+very distant groups a thin steered frontier can still miss a path (raise `--cap`, or
+use `--ensemble`). Treat its output as a hypothesis, more so than the other two.
+
 ### which to use
 
 | you want... | use |
@@ -63,12 +95,15 @@ how many group-pairs the paper bridged, a diagnostic.
 | the provably-shortest bridge(s), cost no object | `bidir --mode exact` |
 | N>=3 and completeness matters | `intersection` |
 | N>=3 quick exploration | `bidir` (budget) |
+| a deeper search steered toward a bridge, ranked by conceptual similarity | `walk` |
+| robustness on a hard case — re-roll the steered search | `walk --ensemble` |
 
-`intersection` is the default strategy.
+`intersection` is the default strategy. `walk` requires the optional embedding
+dependency.
 
 ## Scoring
 
-Both strategies score a candidate bridge the same way:
+`intersection` and `bidir` score a candidate bridge the same way:
 
 - **per-group distance**: the shortest undirected path, in citation hops, from the
   nearest seed of a group to the candidate. one citation link is one hop; edge
@@ -88,15 +123,29 @@ Example, two groups: a paper one hop from each seed scores 2; a paper two hops f
 each scores 4 and ranks below it; a paper reachable from only one group has
 `groups_hit` 1 and is dropped when `--min-groups` is 2.
 
-## Environment setup
+`walk` scores differently (see its [section](#walk--semantic-ensemble)): its `score`
+*fuses* the structural distance with title-embedding similarity (`--alpha`), it adds a
+`recurrence` field, and it drops `cited_by_count` from the ranking (still reported,
+just not ranked on).
 
-Same for both strategies:
+## Environment setup
 
 ```
 pip install -r requirements.txt    # requests, networkx, joblib
 ```
 
-Python 3.10+.
+Python 3.10+. That covers `intersection` and `bidir`.
+
+`walk` additionally needs a local embedding model:
+
+```
+pip install -r requirements-walk.txt    # sentence-transformers (+ torch)
+```
+
+This is a heavier install (~600 MB-1 GB; it pulls in torch). It is kept in a separate
+file so `intersection` / `bidir` users never pay for it — `walk` imports it lazily
+and prints a clear install hint if it is missing. The model downloads once from
+HuggingFace, then runs fully offline; no paper data ever leaves your machine.
 
 ## Usage
 
@@ -116,6 +165,14 @@ python -m citetools --mailto you@example.com --strategy bidir \
 # bidirectional, exact mode
 python -m citetools --mailto you@example.com --strategy bidir --mode exact \
     --group W2626778328 --group W2519887557 --depth 2
+
+# walk: deeper, embedding-steered search (needs requirements-walk.txt)
+python -m citetools --mailto you@example.com --strategy walk \
+    --group W2626778328 --group W2519887557 --depth 4 --cap 120
+
+# walk with a randomised ensemble
+python -m citetools --mailto you@example.com --strategy walk --ensemble -M 5 \
+    --group W2626778328 --group W2519887557 --depth 4
 ```
 
 `--group` is repeated once per research area; each takes comma-separated seed ids
@@ -133,11 +190,18 @@ the graph-convolutional-networks paper (`W2519887557`), and prints, among others
 | flag | meaning | default |
 |---|---|---|
 | `--mailto` | email for the OpenAlex polite pool (required) | : |
-| `--strategy` | `intersection` or `bidir` | `intersection` |
+| `--strategy` | `intersection`, `bidir`, or `walk` | `intersection` |
 | `--mode` | `budget` or `exact`; applies to `bidir` only, ignored otherwise | `budget` |
-| `--frontier-cap` | `bidir` budget-mode per-step frontier cap, *per pairwise engine* (the compute budget); ignored in exact mode and for `intersection` | 50 |
+| `--frontier-cap` | `bidir` budget-mode per-step frontier cap, *per pairwise engine* — a *blunt* compute-budget guard; ignored in exact mode and by other strategies | 50 |
+| `--cap` | `walk` per-step per-engine frontier cap — the *smart*, embedding-steered analogue of `--frontier-cap` (see [below](#--frontier-cap-vs---cap)); ignored by other strategies | 60 |
+| `--ensemble` | `walk`: run a randomised ensemble instead of one deterministic pass | off |
+| `-M`, `--ensemble-runs` | `walk`: ensemble run count (used with `--ensemble`) | 5 |
+| `-p`, `--floor-prob` | `walk`: floor keep-probability in stochastic pruning | 0.15 |
+| `-T`, `--temperature` | `walk`: pruning-sigmoid temperature | 0.1 |
+| `--alpha` | `walk`: structural-vs-embedding fusion weight (1.0 = pure structural) | 0.7 |
+| `--seed` | `walk`: RNG seed for a reproducible ensemble | unseeded |
 | `--group` | one research area; comma-separated seed ids; repeat per area | demo set |
-| `--depth` | citation hops expanded (per seed for `intersection`, per side for `bidir`) | 2 |
+| `--depth` | citation hops expanded (per seed for `intersection`, per side for `bidir`/`walk`) | 2 |
 | `--top-k` | number of bridges to return | 25 |
 | `--min-groups` | how many groups a candidate must reach to qualify | all groups |
 | `--n-jobs` | worker threads for concurrent fetching; 1 = serial | 8 |
@@ -149,6 +213,21 @@ A `--depth 2` run makes many API calls; concurrency speeds this up (bounded by t
 ~10 req/s polite pool rate). `bidir --mode budget` is typically faster than
 `intersection` at the same depth because it stops at the first meeting instead of
 fully growing every neighbourhood.
+
+### `--frontier-cap` vs `--cap`
+
+Both bound how many papers a search step expands — but they are *different knobs for
+different strategies*, and they differ in *how* they choose what to keep:
+
+- **`--frontier-cap`** (`bidir`) is a **blunt** cap: when a step discovers more papers
+  than the cap, it keeps an *arbitrary* subset (by W-id order). Purely a compute-budget
+  guard — it has no notion of which papers are promising.
+- **`--cap`** (`walk`) is a **smart** cap: `walk` keeps the `--cap` papers whose titles
+  are most semantically similar to the group it is steering toward. Same job — bound
+  the step — but the kept subset is *chosen*, not arbitrary.
+
+So raising `--frontier-cap` widens `bidir`'s *arbitrary* slice; raising `--cap` widens
+`walk`'s *steered* slice. Each flag is ignored by the strategy it does not belong to.
 
 ### Progress logging
 
@@ -259,6 +338,7 @@ from citetools import (
     find_bridges,             # intersection
     find_bridges_bidir,       # bidir, N=2
     find_bridges_bidir_nway,  # bidir, N>=3
+    find_bridges_walk,        # walk
 )
 
 client = OpenAlex(mailto="you@example.com")
@@ -275,13 +355,21 @@ c = find_bridges_bidir_nway(
     oracle, [["W2626778328"], ["W2519887557"], ["W3177828909"]], mode="budget",
 )
 
+# walk, any N (needs requirements-walk.txt); optional ensemble
+d = find_bridges_walk(
+    oracle, [["W2626778328"], ["W2519887557"]], depth=4, cap=120,
+    ensemble=True, M=5,
+)
+
 for x in b:
     print(x["score"], x["title"])
 ```
 
 `find_bridges_bidir` takes the two groups as separate positional arguments;
-`find_bridges` and `find_bridges_bidir_nway` take a list of groups. All three return a
-ranked `list[dict]` with the fields described under [Scoring](#scoring).
+`find_bridges`, `find_bridges_bidir_nway`, and `find_bridges_walk` take a list of
+groups. All return a ranked `list[dict]` with the fields described under
+[Scoring](#scoring) (`find_bridges_walk` adds a fused `score` and a `recurrence`
+field).
 
 ## How it works
 
@@ -305,6 +393,12 @@ Layered modules:
     bidirectional search engine plus two aggregators. The engine is a step state
     machine — it asks the aggregator for a frontier's neighbours and advances; the
     aggregator owns all I/O. N>=3 round-robins one engine per group pair.
+  - `walk.py` — `find_bridges_walk`: a cousin of `bidir`. It reuses `bidir`'s engine
+    (uncapped — `frontier_cap=None`), and instead prunes each step's frontier itself,
+    keeping the papers most embedding-similar to the partner group; optionally
+    ensembles and fuses the score. Depends on the optional `citetools/embed.py`.
+- **`citetools/embed.py`** — L1.5 (optional), the local title-embedding layer
+  (`TitleEmbedder`): a lazily-loaded sentence-transformer, used only by `walk`.
 
 Supporting files: `citetools/errors.py` (`OpenAlexError` / `BadId`),
 `citetools/strategies/__init__.py` and `citetools/__init__.py` (the public API),
@@ -348,6 +442,10 @@ pure-CPU search core whose decisions never depend on fetch timing.
   guaranteed N-way intersection use `intersection`.
 - Depth-2 over genuinely distant fields can return an empty result; relax
   `--min-groups`.
+- `walk` is experimental. Its embedding steer is a heuristic, not ground truth: a thin
+  steered frontier can still miss a path between very distant groups (raise `--cap` or
+  use `--ensemble`), and title-embedding similarity is itself only another proxy for
+  conceptual proximity.
 - Concurrency gains are modest and rate-capped: `--n-jobs` only reclaims the rate
   budget a serial run wastes stalling on per-request latency; it cannot exceed the
   ~10 req/s polite-pool ceiling.

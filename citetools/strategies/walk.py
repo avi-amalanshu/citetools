@@ -151,14 +151,15 @@ def find_bridges_walk(
 		else:
 			rngs = [np.random.default_rng() for _ in range(runs)]
 
-		# build engines: one per (run_idx, i, j) pair
+		# build engines: one per (run_idx, i, j) pair. frontier_cap=None leaves the
+		# engine uncapped -- walk's _keep is the sole, embedding-guided frontier prune.
 		engines = {}
 		pairs = list(itertools.combinations(range(N), 2))
 		for run_idx in range(runs):
 			for i, j in pairs:
 				tag = (run_idx, i, j)
 				engines[tag] = (
-					BiDirEngine(canon[i], canon[j], mode="budget", max_depth=depth, frontier_cap=cap),
+					BiDirEngine(canon[i], canon[j], mode="budget", max_depth=depth, frontier_cap=None),
 					rngs[run_idx],
 					seed_emb,
 				)
@@ -235,7 +236,6 @@ def find_bridges_walk(
 				-r["groups_hit"],
 				r["score"],
 				-r["recurrence"],
-				-(r.get("cited_by_count") or 0),
 				r["id"]
 			)
 		)
