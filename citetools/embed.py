@@ -81,6 +81,11 @@ class TitleEmbedder:
              call self._model.encode() ONCE with all miss titles, receive (n, dim)
              L2-normalized ndarray, store each vector in self._cache keyed by W-id.
           4. Return all embeddings from self._cache, preserving the input keys.
+
+        Edge cases:
+          None / non-str title values are coerced to "" before encoding. OpenAlex
+          works can carry an explicit "title": null, which dict.get("title", "")
+          surfaces as None; encoding such a value would crash the tokenizer.
         """
         if not items:
             return {}
@@ -97,9 +102,11 @@ class TitleEmbedder:
             if not misses:
                 return hits
 
-            # deterministic order for batching
+            # deterministic order for batching; coerce None / non-str to ""
             sorted_wids = sorted(misses.keys())
-            titles = [misses[wid] for wid in sorted_wids]
+            titles = [
+                misses[wid] if isinstance(misses[wid], str) else "" for wid in sorted_wids
+            ]
 
             # batch encode all misses with L2 normalization
             vectors = self._model.encode(

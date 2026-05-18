@@ -133,14 +133,15 @@ def find_bridges_walk(
 	)
 
 	try:
-		# precompute seed-title embeddings
-		seed_titles = {}
-		for gi, g in enumerate(canon):
-			for wid in g:
-				if wid not in seed_titles:
-					seed_titles[wid] = None  # placeholder; will be filled from metadata
-		# for now, use empty/zero embeddings for seeds (they won't be in frontier)
-		seed_emb = {gi: {} for gi in range(N)}
+		# precompute seed-title embeddings, indexed by group.
+		# work() resolves any id form (w-id, doi, arxiv) -- works() skips
+		# doi: keys, so per-seed work() calls are used (seeds are few).
+		seed_wids = sorted(set().union(*canon))
+		seed_titles = {
+			w: (oracle.client.work(w).get("title") or "") for w in seed_wids
+		}
+		seed_vecs = embedder.embed(seed_titles)
+		seed_emb = {gi: {w: seed_vecs[w] for w in g} for gi, g in enumerate(canon)}
 
 		# spawn runs with seeded RNGs
 		if seed is not None:
