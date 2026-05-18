@@ -19,8 +19,9 @@ log = logging.getLogger("citetools.openalex")
 
 # bounded GET retries on a 429/5xx before giving up
 _MAX_ATTEMPTS = 5
-# ceiling (seconds) on any single fleet-wide cooldown, incl. a server Retry-After
-_COOLDOWN_CAP = 60.0
+# ceiling (seconds) on the exponential backoff used when a 429/5xx carries no
+# Retry-After; a server-supplied Retry-After is honored in full, uncapped
+_FALLBACK_COOLDOWN = 60.0
 
 # arxiv abs/pdf url; captures the id, tolerates http(s)://, www., a .pdf suffix
 # and a trailing slash. the id keeps any internal '/' for old-style arxiv ids.
@@ -112,15 +113,17 @@ class _RateLimiter:
 
 		Every thread's next acquire() then blocks until the cooldown elapses,
 		so the whole client backs off together. cooldown = the server's
-		Retry-After when given, else exponential in the consecutive-strike
-		count; capped at _COOLDOWN_CAP. returns the cooldown applied (seconds).
+		Retry-After honored IN FULL when given (a fixed-window reset -- the
+		server 429s every earlier request, so a shorter wait is wasted), else
+		exponential in the consecutive-strike count capped at _FALLBACK_COOLDOWN.
+		returns the cooldown applied (seconds).
 		"""
 		with self._lock:
 			self._strikes += 1
 			if retry_after is not None:
-				cooldown = min(retry_after, _COOLDOWN_CAP)
+				cooldown = retry_after
 			else:
-				cooldown = min(2.0 ** self._strikes, _COOLDOWN_CAP)
+				cooldown = min(2.0 ** self._strikes, _FALLBACK_COOLDOWN)
 			self._next = max(self._next, time.monotonic() + cooldown)
 			return cooldown
 
