@@ -141,7 +141,7 @@ def find_bridges_walk(
 			w: (oracle.client.work(w).get("title") or "") for w in seed_wids
 		}
 		seed_vecs = embedder.embed(seed_titles)
-		seed_emb = {gi: {w: seed_vecs[w] for w in g} for gi, g in enumerate(canon)}
+		seed_emb = {gi: {w: seed_vecs[w] for w in g if w in seed_vecs} for gi, g in enumerate(canon)}
 
 		# spawn runs with seeded RNGs
 		if seed is not None:
@@ -368,7 +368,8 @@ def _keep(
 	    p + (1-p)*sigmoid((h_a(n) - h_med) / T). if |kept| > cap, keep
 	    top-cap by h_a.
 
-	a node with no embedding gets h_a = 0.0.
+	a node with no title embedding gets the neutral (median) h_a -- the prune
+	does not penalise a paper for missing metadata.
 
 	Args:
 	  frontier: set of node ids.
@@ -384,10 +385,17 @@ def _keep(
 	  set of frontier nodes to keep (size <= cap).
 	"""
 	frontier_list = sorted(frontier)
-	h_a = np.array([
-		sim_to_set(node_embs[n], target_embs, agg="max") if n in node_embs else 0.0
-		for n in frontier_list
-	], dtype=np.float32)
+	# h_a(n) = max-similarity to the partner group's seeds. a node with no
+	# title embedding gets the neutral (median) h_a, so the prune neither
+	# favours nor penalises it for missing metadata.
+	scored = {
+		n: sim_to_set(node_embs[n], target_embs, agg="max")
+		for n in frontier_list if n in node_embs
+	}
+	neutral = float(np.median(list(scored.values()))) if scored else 0.0
+	h_a = np.array(
+		[scored.get(n, neutral) for n in frontier_list], dtype=np.float32
+	)
 
 	if deterministic:
 		# top-cap deterministic
@@ -433,7 +441,7 @@ def _score(
 	    to seed_emb[group_idx].values(). Clipped to [0,1].
 	  - score = alpha * struct_norm + (1 - alpha) * (1 - embsim).
 
-	node with no embedding gets embsim = 0.0 (worst similarity).
+	a candidate with no title embedding: the embedding layer abstains, score = struct_norm.
 
 	Args:
 	  candidates: list of non-seed node ids to score.
@@ -457,25 +465,23 @@ def _score(
 		struct = sum(pg.values())
 		struct_norm = struct / (groups_hit * depth) if groups_hit > 0 else float("inf")
 
-		# embedding similarity: min over hit groups
-		hit_groups = set(pg.keys())
+		# embedding similarity: min over reached groups of max-sim to that
+		# group's seeds. a candidate (or group) lacking a title embedding
+		# contributes no signal; if nothing is comparable the embedding layer
+		# abstains and the score is purely structural.
 		embsim_vals = []
-		for g in hit_groups:
-			if cand in cand_emb:
+		if cand in cand_emb:
+			for g in pg:
 				seed_embs_g = seed_emb.get(g, {})
 				if seed_embs_g:
 					target = np.vstack(list(seed_embs_g.values()))
-					sim = sim_to_set(cand_emb[cand], target, agg="max")
-				else:
-					sim = 0.0
-			else:
-				sim = 0.0
-			embsim_vals.append(sim)
+					embsim_vals.append(sim_to_set(cand_emb[cand], target, agg="max"))
 
-		embsim = min(embsim_vals) if embsim_vals else 0.0
-		embsim = np.clip(embsim, 0.0, 1.0)
-
-		score = alpha * struct_norm + (1 - alpha) * (1 - embsim)
+		if embsim_vals:
+			embsim = min(embsim_vals)
+			score = alpha * struct_norm + (1 - alpha) * (1 - embsim)
+		else:
+			score = struct_norm
 
 		w = meta.get(cand, {})
 		records.append({

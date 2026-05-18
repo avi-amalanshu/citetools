@@ -71,21 +71,21 @@ class TitleEmbedder:
           items: dict mapping W-id (str) -> title text (str). Title may be empty.
 
         Returns:
-          dict mapping W-id -> embedding vector, shape (dim,), dtype float32, L2-norm == 1.
+          dict mapping W-id -> (dim,) float32 L2-normalized vector. a wid whose
+          title is missing / empty / non-str is OMITTED (see Edge cases).
 
         Control flow:
           1. If items is empty, return {}.
-          2. Partition items into cache_hits (W-id already in self._cache) and
-             misses (W-id not yet cached).
-          3. For misses, extract the title strings (sorted by W-id for determinism),
-             call self._model.encode() ONCE with all miss titles, receive (n, dim)
-             L2-normalized ndarray, store each vector in self._cache keyed by W-id.
-          4. Return all embeddings from self._cache, preserving the input keys.
+          2. Partition items into cache hits and misses.
+          3. For misses with a usable (non-empty str) title, batch-encode in one
+             self._model.encode() call and cache each (dim,) L2-normalized vector.
+          4. Return the cached vectors for all input wids that have one.
 
         Edge cases:
-          None / non-str title values are coerced to "" before encoding. OpenAlex
-          works can carry an explicit "title": null, which dict.get("title", "")
-          surfaces as None; encoding such a value would crash the tokenizer.
+          a missing, empty, or non-str title carries no semantic signal, so that
+          wid is skipped -- never encoded, absent from the returned dict. callers
+          detect this via `wid not in result` and apply a neutral fallback.
+          (OpenAlex works can carry an explicit "title": null.)
         """
         if not items:
             return {}
@@ -102,26 +102,24 @@ class TitleEmbedder:
             if not misses:
                 return hits
 
-            # deterministic order for batching; coerce None / non-str to ""
-            sorted_wids = sorted(misses.keys())
-            titles = [
-                misses[wid] if isinstance(misses[wid], str) else "" for wid in sorted_wids
-            ]
-
-            # batch encode all misses with L2 normalization
-            vectors = self._model.encode(
-                titles,
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-                show_progress_bar=False,
+            # encode only misses with a usable (non-empty str) title; a missing,
+            # empty, or non-str title carries no semantic signal -- skip it.
+            sorted_wids = sorted(
+                wid for wid in misses
+                if isinstance(misses[wid], str) and misses[wid].strip()
             )
+            if sorted_wids:
+                vectors = self._model.encode(
+                    [misses[wid] for wid in sorted_wids],
+                    normalize_embeddings=True,
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
+                )
+                for wid, vec in zip(sorted_wids, vectors):
+                    self._cache[wid] = vec
 
-            # store in cache
-            for wid, vec in zip(sorted_wids, vectors):
-                self._cache[wid] = vec
-
-            # return all from cache in input order
-            return {wid: self._cache[wid] for wid in items}
+            # return cached vectors; titleless wids are absent by design
+            return {wid: self._cache[wid] for wid in items if wid in self._cache}
 
     @property
     def dim(self) -> int:
