@@ -1,7 +1,7 @@
 """
 Concurrent nbrs fetching via joblib threading.
 
-Wraps CiteGraph.nbrs calls for thread-pool dispatch. Isolates per-node
+Wraps oracle.nbrs calls for thread-pool dispatch. Isolates per-node
 failures so one HTTP error does not abort the batch. Preserves input
 node order in results via joblib's default list semantics.
 """
@@ -10,7 +10,7 @@ import logging
 
 from joblib import delayed
 
-log = logging.getLogger("citetools.parallel")
+log = logging.getLogger("citetools.io.parallel")
 
 
 def _nbrs_safe(oracle, node: str, progress: bool = False) -> dict | Exception:
@@ -22,16 +22,16 @@ def _nbrs_safe(oracle, node: str, progress: bool = False) -> dict | Exception:
       - if any exception is raised, catch it and return it as-is
       - if progress: log the node on completion (runs in the worker thread,
         so the log line marks true per-node completion)
-      - otherwise return the result dict {"refs": [...], "citers": [...]}
+      - otherwise return the result dict
 
     Args:
-      oracle: CiteGraph instance
+      oracle: OpenAlex instance (impure; rate-limited HTTP client)
       node: canonical W-id string
       progress: if True, emit an info log line when this node completes
 
     Returns:
-      dict with keys "refs" and "citers" (each a list of W-ids) on success;
-      Exception instance on failure (never re-raised).
+      dict with keys "refs", "citers", "title", "year", "doi", "cited_by_count"
+      on success; Exception instance on failure (never re-raised).
     """
     try:
         res = oracle.nbrs(node)
@@ -51,14 +51,14 @@ def fetch_all(
     Proc:
       - if nodes is empty: return {}
       - if parallel is None: run serially
-          result_dict = {n: _nbrs_safe(oracle, n) for n in nodes}
+          result_dict = {n: _nbrs_safe(oracle, n, progress) for n in nodes}
       - if parallel is a Parallel object: dispatch concurrently
-          results = parallel(delayed(_nbrs_safe)(oracle, n) for n in nodes)
+          results = parallel(delayed(_nbrs_safe)(oracle, n, progress) for n in nodes)
           result_dict = dict(zip(nodes, results))
       - return result_dict
 
     Args:
-      oracle: CiteGraph instance
+      oracle: OpenAlex instance (impure; rate-limited HTTP client)
       nodes: ordered sequence of canonical W-id strings; may be empty
       parallel: None (serial mode) or a bound Parallel object from
                 joblib.Parallel(..., backend="threading") (concurrent mode).
@@ -68,7 +68,7 @@ def fetch_all(
 
     Returns:
       dict mapping each input node id to its nbrs result or Exception.
-      {node: {"refs": [...], "citers": [...]} | Exception for each node in input order}
+      {node: {"refs": [...], "citers": [...], ...} | Exception for each node in input order}
 
     Order preservation:
       joblib.Parallel's default return_as="list" guarantees that the returned

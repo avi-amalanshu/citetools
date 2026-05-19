@@ -1,7 +1,15 @@
-"""OpenAlex HTTP client with polite-pool retry and dual caching."""
+"""OpenAlex HTTP client with polite-pool retry and dual caching.
+
+Stateful impure module: manages thread-local sessions, rate limiting, and
+shared caches. No behavior change from the current implementation; functions
+for id normalization and header parsing are moved to core.parse (and imported
+back where needed).
+
+Public surface: OpenAlex class with methods work, works, citers, search, wid,
+nbrs, clear, close.
+"""
 
 import logging
-import re
 import threading
 import time
 from collections.abc import Iterable
@@ -11,7 +19,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from .errors import BadId, OpenAlexError
+from ..core import parse
+from ..errors import BadId, OpenAlexError
 
 OPENALEX_BASE = "https://api.openalex.org"
 
@@ -23,62 +32,14 @@ _MAX_ATTEMPTS = 5
 # Retry-After; a server-supplied Retry-After is honored in full, uncapped
 _FALLBACK_COOLDOWN = 60.0
 
-# arxiv abs/pdf url; captures the id, tolerates http(s)://, www., a .pdf suffix
-# and a trailing slash. the id keeps any internal '/' for old-style arxiv ids.
-_ARXIV_URL = re.compile(
-	r"^(?:https?://)?(?:www\.)?arxiv\.org/(?:abs|pdf)/(?P<id>.+?)(?:\.pdf)?/?$",
-	re.IGNORECASE,
-)
-# bare new-style arxiv id, e.g. 2010.11929 or 2010.11929v2
-_ARXIV_ID = re.compile(r"^\d{4}\.\d{4,5}(?:v\d+)?$")
-
-
-def _arxiv_doi(pid: str) -> str | None:
-	"""Map an arxiv abs/pdf link or bare new-style arxiv id to its arxiv doi.
-
-	'https://arxiv.org/abs/2010.11929v2' -> '10.48550/arxiv.2010.11929'
-	'2010.11929'                         -> '10.48550/arxiv.2010.11929'
-	anything not recognisably arxiv      -> None.
-	the version suffix (vN) and a trailing '.pdf' are stripped; an old-style
-	id keeps its internal '/' (e.g. cs/0701001).
-	"""
-	m = _ARXIV_URL.match(pid)
-	if m:
-		aid = m.group("id")
-	elif _ARXIV_ID.match(pid):
-		aid = pid
-	else:
-		return None
-	aid = re.sub(r"v\d+$", "", aid)  # strip version suffix
-	return f"10.48550/arxiv.{aid.lower()}"
-
-
-def _retry_after(response: requests.Response) -> float | None:
-	"""Parse a Retry-After header to seconds.
-
-	integer-seconds form -> float; absent or http-date form -> None (the
-	caller falls back to exponential backoff). a non-positive value is
-	treated as absent.
-	"""
-	raw = response.headers.get("Retry-After")
-	if raw is None:
-		return None
-	try:
-		secs = float(raw)
-	except ValueError:
-		return None
-	return secs if secs > 0 else None
-
 
 class _RateLimiter:
-	"""Shared rate-limiter for concurrent threads: caps aggregate request rate at 1/interval req/s.
+	"""Shared rate-limiter for concurrent threads.
 
-	acquire() reserves a thread's slot under a lock (O(1) per-thread), then sleeps outside the
-	lock. N threads thus reserve staggered slots and reach throughput N threads concurrently
-	requesting, with aggregate rate exactly 1/interval req/s, without serializing to 1 req/s.
-
-	penalize() registers a server throttle by pushing the shared slot forward, so every thread
-	cools down together; relax() clears the escalation after a success.
+	Caps aggregate request rate at 1/interval req/s without serializing.
+	acquire() reserves thread slot under lock, sleeps outside lock.
+	penalize() pushes the shared slot forward (fleet-wide cooldown).
+	relax() clears consecutive-strike counter on success.
 	"""
 
 	def __init__(self, interval: float) -> None:
@@ -89,7 +50,7 @@ class _RateLimiter:
 		self.interval = interval
 		self._lock = threading.Lock()
 		self._next = 0.0
-		self._strikes = 0  # consecutive server-throttle events
+		self._strikes = 0
 
 	def acquire(self) -> None:
 		"""Reserve this thread's slot and sleep appropriately.
@@ -160,11 +121,36 @@ class OpenAlex:
 	) -> None:
 		"""Initialize OpenAlex client with polite-pool settings and thread-safe concurrency.
 
-		mailto: email address for User-Agent and polite-pool qualification.
-		sleep: delay after each successful HTTP response (seconds); also caps aggregate request rate.
-		timeout: request timeout (seconds).
-		citer_k: default page size for citers() calls.
-		session: optional requests.Session for test injection; if None, uses thread-local sessions.
+		Proc:
+		  - store mailto (email for User-Agent and polite-pool qualification)
+		  - store sleep (interval seconds, caps aggregate request rate)
+		  - store timeout (request timeout seconds)
+		  - store citer_k (default page size for citers() calls)
+		  - build shared _RateLimiter(_RateLimiter(sleep))
+		  - if session is injected (not None):
+		      set User-Agent header to "citetools/1.0 (mailto)"
+		      store in self._injected_session
+		      set self._local to None (test path)
+		  - else (production path):
+		      store _injected_session = None
+		      init self._local = threading.local() (thread-local storage)
+		      init self._sessions = [] (list of managed sessions)
+		      init self._sessions_lock = threading.Lock()
+		  - init self._cache = {} (canonical_wid -> full work dict)
+		  - init self._meta = {} (canonical_wid -> trimmed work dict)
+		  - build self.params = {"mailto": mailto} (passed to every HTTP call)
+
+		Args:
+		  mailto: email address for User-Agent header and polite-pool qualification
+		  sleep: delay (seconds) after each successful HTTP response; also caps
+		    aggregate request rate across threads
+		  timeout: HTTP request timeout (seconds)
+		  citer_k: default page size for citers() calls (overridable per call)
+		  session: optional requests.Session for test injection; if None, uses
+		    thread-local sessions (production)
+
+		Raises:
+		  None (validation deferred to the caller)
 		"""
 		self.mailto = mailto
 		self.sleep = sleep
@@ -227,16 +213,18 @@ class OpenAlex:
 	def _get(self, url: str, params: dict, *, desc: str) -> dict:
 		"""Rate-limited GET with fleet-wide cooldown retry on 429 / 5xx.
 
-		desc: short human label for the resource, used in logs and errors.
-		Proc: for up to _MAX_ATTEMPTS attempts:
-		  - _limiter.acquire() -- blocks for any pending fleet-wide cooldown
-		  - GET; a transport-level error -> raise OpenAlexError immediately
-		  - status 429 or >= 500 -> _limiter.penalize(Retry-After), log a
-		    warning, retry
+		desc: human label for the resource (used in logs/errors)
+
+		Proc: up to _MAX_ATTEMPTS attempts:
+		  - _limiter.acquire() blocks for fleet-wide cooldown
+		  - GET request; transport error -> raise OpenAlexError
+		  - status 429 or >= 500 -> parse Retry-After header via parse.retry_after,
+		    _limiter.penalize(retry_after), log warning, retry
 		  - else -> raise_for_status, _limiter.relax(), return parsed json
-		Exhausting all attempts -> raise OpenAlexError naming desc.
-		raises OpenAlexError (transport failure, non-retryable status, or
-		retries exhausted).
+		  - exhaust attempts -> raise OpenAlexError
+
+		Raises:
+		  OpenAlexError (transport failure, non-retryable status, or exhausted retries)
 		"""
 		for attempt in range(1, _MAX_ATTEMPTS + 1):
 			self._limiter.acquire()
@@ -246,7 +234,7 @@ class OpenAlex:
 				raise OpenAlexError(f"failed to fetch {desc}: {e}") from e
 
 			if response.status_code == 429 or response.status_code >= 500:
-				cooldown = self._limiter.penalize(_retry_after(response))
+				cooldown = self._limiter.penalize(parse.retry_after(response))
 				log.warning(
 					"openalex %d on %s; cooling down %.1fs (attempt %d/%d)",
 					response.status_code, desc, cooldown, attempt, _MAX_ATTEMPTS,
@@ -266,59 +254,23 @@ class OpenAlex:
 			f"failed to fetch {desc}: still rate-limited after {_MAX_ATTEMPTS} attempts"
 		)
 
-	@staticmethod
-	def key(pid: str) -> str:
-		"""Normalize pid (DOI, bare W-id, OpenAlex URL, or arxiv link) to canonical lookup key.
-
-		-> 'W12345' (uppercase), 'doi:10.xxxx/yyyy' (lowercase doi), or raises BadId.
-		Accepts: 'W123', 'https://openalex.org/W123', '10.1038/nature12373',
-		  'https://doi.org/10.1038/nature12373', 'https://arxiv.org/abs/2010.11929',
-		  'https://arxiv.org/pdf/2010.11929v2', and bare new-style arxiv ids.
-		arxiv links resolve via the arxiv doi 10.48550/arxiv.<id>.
-		"""
-		# reject empty
-		if not pid:
-			raise BadId("empty id")
-
-		# already a canonical doi key -> key() must be idempotent
-		if pid.startswith("doi:"):
-			return "doi:" + pid[4:].lower()
-
-		# openalex full url
-		if pid.startswith("https://openalex.org/"):
-			canonical = pid.rsplit("/", 1)[-1]
-			if not re.match(r"^W\d+$", canonical):
-				raise BadId(f"malformed OpenAlex URL: {pid}")
-			return canonical.upper()
-
-		# arxiv abs/pdf link or bare new-style arxiv id -> arxiv doi
-		# (checked before the doi branch: arxiv urls also contain '/')
-		adoi = _arxiv_doi(pid)
-		if adoi is not None:
-			return f"doi:{adoi}"
-
-		# doi: has / but not url scheme (or is https://doi.org/...)
-		if "/" in pid:
-			if pid.startswith("https://doi.org/"):
-				doi_part = pid.split("https://doi.org/")[-1]
-			else:
-				doi_part = pid
-			return f"doi:{doi_part.lower()}"
-
-		# bare w-id
-		if not re.match(r"^W\d+$", pid):
-			raise BadId(f"malformed id: {pid}")
-		return pid.upper()
-
 	def work(self, pid: str) -> dict[str, Any]:
 		"""Fetch one full work by any id form; cache by canonical W-id.
 
-		pid -> key (normalized) -> HTTP GET /works/{key} -> extract canonical_wid
-		  from response["id"] -> cache full object in _cache[canonical_wid] and
-		  _cache[key]; also in _meta. rate-limit, return data.
-		raises BadId (from key), OpenAlexError (HTTP failures).
+		Proc:
+		  - normalize pid via parse.key(pid) -> lookup_key
+		  - check _cache[lookup_key]; if present, return cached data
+		  - GET /works/{lookup_key}; parse JSON response
+		  - extract canonical W-id: data["id"].rsplit("/", 1)[-1].upper()
+		  - cache full data in _cache[canonical_wid] and _cache[lookup_key]
+		  - cache full data in _meta[canonical_wid]
+		  - return data
+
+		Raises:
+		  BadId (from parse.key())
+		  OpenAlexError (HTTP failures via _get)
 		"""
-		lookup_key = self.key(pid)
+		lookup_key = parse.key(pid)
 
 		# check _cache
 		if lookup_key in self._cache:
@@ -341,11 +293,32 @@ class OpenAlex:
 	def works(self, pids: Iterable[str]) -> dict[str, dict[str, Any]]:
 		"""Batch-fetch up to 50 full works per HTTP call via filter=openalex:W1|W2|...
 
-		Skips ids already in _cache; returns dict {canonical_wid: work_dict} for found ids.
-		empty input -> {}, no HTTP call. missing ids -> absent from result.
-		Only bare W-ids batched; DOIs passed through but not fetched (would require
-		separate work() calls). caches full objects in _cache and _meta by canonical_wid.
-		raises BadId (from key), OpenAlexError (HTTP failures).
+		Proc:
+		  - convert pids to list
+		  - if empty, return {}
+		  - init to_fetch = [], out = {}
+		  - for each pid in pids_list:
+		      * normalize via parse.key(pid) -> lookup_key
+		      * check _cache[lookup_key]:
+		          - if hit: extract canonical_wid from cached data; add to out
+		          - if miss: append lookup_key to to_fetch
+		  - filter to_fetch to bare W-ids (skip "doi:" prefixed, as they require
+		    separate work() calls)
+		  - batch by 50:
+		      * build filter_str = "openalex:" + "|".join(chunk)
+		      * GET /works with filter and per-page=50
+		      * cache each returned work in _cache[canonical_wid], _meta[canonical_wid]
+		      * add to out
+		  - return out
+
+		Raises:
+		  BadId (from parse.key())
+		  OpenAlexError (HTTP failures)
+
+		Edge cases:
+		  - empty input -> return {} (no HTTP call)
+		  - missing ids -> absent from result
+		  - DOIs -> not fetched via batch (cached only, not in to_fetch)
 		"""
 		pids_list = list(pids)
 
@@ -358,7 +331,7 @@ class OpenAlex:
 		out: dict[str, dict[str, Any]] = {}
 
 		for pid in pids_list:
-			lookup_key = self.key(pid)
+			lookup_key = parse.key(pid)
 			if lookup_key in self._cache:
 				# extract canonical from cached data
 				cached_data = self._cache[lookup_key]
@@ -392,13 +365,26 @@ class OpenAlex:
 		return out
 
 	def citers(self, pid: str, k: int | None = None) -> list[str]:
-		"""Fetch ONE page of works that cite pid (sorted by cited_by_count desc).
+		"""Fetch one page of citing works for a work, ranked by cited_by_count desc.
 
-		pid -> canonical_wid (via work()) -> GET /works?filter=cites:{wid}&...&select=...
-		-> extract canonical W-ids from trimmed response. cache trimmed objects in _meta
-		ONLY (not _cache, to prevent partial-cache poisoning). returns list of canonical
-		W-ids; zero citers -> []. ONE page only, no pagination. k defaults to citer_k.
-		raises BadId (from key), OpenAlexError (HTTP failures).
+		Proc:
+		  - if k is None, set k = self.citer_k
+		  - fetch seed work via work(pid) -> canonical_wid via rsplit
+		  - GET /works?filter=cites:{canonical_wid}&sort=cited_by_count:desc&per-page=k
+		    with select="id,title,publication_year,cited_by_count,doi"
+		  - extract canonical W-ids from results; cache trimmed work dicts in _meta only
+		    (NOT _cache, to avoid partial-cache poisoning)
+		  - return list of canonical W-ids
+		  - zero citers -> [] (graceful)
+
+		Raises:
+		  BadId (from work())
+		  OpenAlexError (HTTP failures)
+
+		Edge cases:
+		  - unknown node -> work() may raise or return data with no citers
+		  - missing k -> uses self.citer_k
+		  - one page only, no pagination
 		"""
 		if k is None:
 			k = self.citer_k
@@ -433,11 +419,20 @@ class OpenAlex:
 	def search(self, query: str, k: int = 5) -> list[dict[str, Any]]:
 		"""Search works by title; return up to k trimmed candidate records.
 
-		query -> GET /works?filter=title.search:{query}&per-page=k&select=...
-		-> list of trimmed work dicts (id, title, publication_year,
-		cited_by_count, doi), ranked by OpenAlex relevance. caches the trimmed
-		objects in _meta only. blank query -> []. ONE page, no pagination.
-		raises OpenAlexError (HTTP failures).
+		Proc:
+		  - if query is blank, return []
+		  - GET /works?filter=title.search:{query}&per-page=k
+		    with select="id,title,publication_year,cited_by_count,doi"
+		  - extract trimmed work dicts from results
+		  - cache in _meta only
+		  - return results
+
+		Raises:
+		  OpenAlexError (HTTP failures)
+
+		Edge cases:
+		  - blank query -> [] (no HTTP call)
+		  - one page only, no pagination
 		"""
 		if not query.strip():
 			return []
@@ -461,18 +456,113 @@ class OpenAlex:
 		return results
 
 	def wid(self, pid: str) -> str:
-		"""Resolve any id form to its bare canonical OpenAlex W-id.
+		"""Resolve any id form to its canonical OpenAlex W-id.
 
-		pid (W-id, DOI, OpenAlex URL, or arxiv abs/pdf link) -> work() ->
-		bare 'Wxxxxx'. raises BadId (from key), OpenAlexError (HTTP / not found).
+		Proc:
+		  - fetch work via work(pid)
+		  - extract and return canonical W-id: data["id"].rsplit("/", 1)[-1].upper()
+
+		Raises:
+		  BadId (from work())
+		  OpenAlexError (HTTP failures)
 		"""
 		return self.work(pid)["id"].rsplit("/", 1)[-1].upper()
+
+	def nbrs(self, node: str) -> dict[str, Any]:
+		"""Fetch neighborhood (refs + citers) and metadata for a node.
+
+		Oracle method for core.engines.intersection and runtime.fetch_all.
+		Composes work(node) (for referenced_works -> refs) and citers(node);
+		shapes the result using core.parse helpers; caches in _meta.
+
+		Proc:
+		  - fetch work via work(node) -- handles canonicalization, caching, errors
+		  - if work fetch raises or returns None: return {"refs": [], "citers": [],
+		    "title": None, "year": None, "doi": None, "cited_by_count": None}
+		  - extract refs:
+		      * get work["referenced_works"] (list of full OpenAlex URLs)
+		      * for each url: parse.key(url) to canonicalize to bare W-id
+		      * null-guard: absent/None -> []
+		  - extract citers: citers(node) -> list of bare W-ids (already canonical)
+		  - extract metadata: meta_dict = parse.meta(work) -> dict with keys
+		    {title, year, doi, cited_by_count}; None-safe
+		  - merge and return: {
+		      "refs": refs,
+		      "citers": citers,
+		      "title": meta_dict["title"],
+		      "year": meta_dict["year"],
+		      "doi": meta_dict["doi"],
+		      "cited_by_count": meta_dict["cited_by_count"]
+		    }
+
+		Args:
+		  node: canonical W-id (bare "Wxxxx") or any form accepted by work()
+
+		Returns:
+		  dict with keys: refs, citers, title, year, doi, cited_by_count.
+		  - refs: list of canonical W-ids referenced by node
+		  - citers: list of canonical W-ids citing node
+		  - title, year, doi, cited_by_count: metadata (may be None)
+		  - unknown or missing node -> refs=[], citers=[], metadata=None
+
+		Raises:
+		  BadId (from work() if normalization fails)
+		  OpenAlexError (HTTP failures)
+
+		Edge cases:
+		  - node not found: work() may raise or return sparse data; return empty
+		    neighbors + None metadata gracefully
+		  - referenced_works absent or None: refs = []
+		  - node has no citers: citers = [] (graceful)
+		  - no metadata: parse.meta returns all-None dict
+		"""
+		try:
+			work_data = self.work(node)
+		except Exception:
+			# unknown node or fetch error; return empty neighborhood
+			return {
+				"refs": [],
+				"citers": [],
+				"title": None,
+				"year": None,
+				"doi": None,
+				"cited_by_count": None,
+			}
+
+		if work_data is None:
+			return {
+				"refs": [],
+				"citers": [],
+				"title": None,
+				"year": None,
+				"doi": None,
+				"cited_by_count": None,
+			}
+
+		# extract refs: canonicalize each referenced_works URL to bare W-id
+		refs_raw = work_data.get("referenced_works") or []
+		refs = [parse.key(url) for url in refs_raw]
+
+		# extract citers: already returns canonical W-ids
+		citers_list = self.citers(node)
+
+		# extract metadata using parse.meta (None-safe)
+		meta_dict = parse.meta(work_data)
+
+		return {
+			"refs": refs,
+			"citers": citers_list,
+			"title": meta_dict["title"],
+			"year": meta_dict["year"],
+			"doi": meta_dict["doi"],
+			"cited_by_count": meta_dict["cited_by_count"],
+		}
 
 	def clear(self) -> None:
 		"""Drop all cached full works and metadata.
 
 		Useful for long-running or memory-constrained scripts.
-		next fetch will hit the API.
+		Next fetch will hit the API.
 		"""
 		self._cache.clear()
 		self._meta.clear()
@@ -481,8 +571,7 @@ class OpenAlex:
 		"""Close all managed sessions.
 
 		Test path: if session was injected, close it. Production path: close all
-		thread-local sessions registered in self._sessions. Idempotent (safe to
-		call multiple times).
+		thread-local sessions registered in self._sessions. Idempotent.
 		"""
 		if self._injected_session is not None:
 			self._injected_session.close()
