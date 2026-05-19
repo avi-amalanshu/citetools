@@ -6,14 +6,10 @@ covered by semantic scholar or whatever.
 ## Citation bridge finder
 
 give it N groups of seed papers: each group standing for one research idea or area:
-and it returns papers that sit in the citation neighbourhood of *every* group. those
-are candidate "bridge" papers: works that connect the areas you handed it.
-
-- N=2 is a pairwise connector (an analogue of Inciteful's Literature Connector).
-- N>=3 connects three or more areas at once.
+and it returns papers that sit in the citation neighbourhood of *every* group.
 
 it runs on the OpenAlex API: free, no key, you just supply a `mailto` so they can
-reach you if your script misbehaves (their "polite pool").
+reach you if your script misbehaves (their "polite pool"). (Watch out for rate limits.)
 
 treat it as an exploratory / hypothesis-generation tool: the output is candidates to
 inspect, not ground truth. see [limitations](#limitations).
@@ -34,7 +30,7 @@ several re-seeding rounds on top. They are more experimental tools, each with it
 philosophy (see [`walk`](#walk--semantic-ensemble) and
 [`refine`](#refine--iterative-path-bootstrap) below).
 
-### `intersection` — exhaustive
+### `intersection` — exhaustive directed search
 
 Grows a citation neighbourhood of radius `--depth` around every group's seeds, then
 scores every non-seed paper by its summed shortest-path distance to each group. Keeps
