@@ -177,11 +177,15 @@ class OpenAlex:
 			self._sessions: list = []
 			self._sessions_lock = threading.Lock()
 
-		# dual caches: both empty dicts
+		# caches: full works, trimmed metadata, citers-query lists, search results.
+		# all keyed by paper id / query -- not by seed/group/strategy -- so they
+		# are reused across every run.
 		self._cache: dict[str, dict[str, Any]] = {}
 		self._meta: dict[str, dict[str, Any]] = {}
+		self._citers: dict[str, list[str]] = {}
+		self._search: dict[str, list[dict[str, Any]]] = {}
 
-		# optional on-disk cache: persists _cache/_meta across runs so repeated
+		# optional on-disk cache: persists the caches across runs so repeated
 		# fetches never re-hit openalex (cuts the 429 rate). disabled when
 		# cache_path is None -- then behavior is unchanged.
 		self._cache_path = Path(cache_path) if cache_path else None
@@ -203,8 +207,10 @@ class OpenAlex:
 			data = json.loads(self._cache_path.read_text())
 			self._cache = data.get("cache", {})
 			self._meta = data.get("meta", {})
-			log.info("loaded %d cached work(s) from %s", len(self._cache),
-			         self._cache_path)
+			self._citers = data.get("citers", {})
+			self._search = data.get("search", {})
+			log.info("loaded %d cached work(s) + %d citer-list(s) from %s",
+			         len(self._cache), len(self._citers), self._cache_path)
 		except Exception as e:
 			log.warning("ignoring unreadable cache %s: %s", self._cache_path, e)
 
@@ -218,7 +224,12 @@ class OpenAlex:
 		"""
 		if self._cache_path is None:
 			return
-		snapshot = {"cache": dict(self._cache), "meta": dict(self._meta)}
+		snapshot = {
+			"cache": dict(self._cache),
+			"meta": dict(self._meta),
+			"citers": dict(self._citers),
+			"search": dict(self._search),
+		}
 		self._cache_path.parent.mkdir(parents=True, exist_ok=True)
 		tmp = self._cache_path.with_suffix(self._cache_path.suffix + ".tmp")
 		tmp.write_text(json.dumps(snapshot))
@@ -449,6 +460,11 @@ class OpenAlex:
 		seed_work = self.work(pid)
 		canonical_wid = seed_work["id"].rsplit("/", 1)[-1].upper()
 
+		# citers-query cache (keyed by wid + page size): a hit skips the API
+		ckey = f"{canonical_wid}:{k}"
+		if ckey in self._citers:
+			return list(self._citers[ckey])
+
 		# fetch citers via the rate-limited, cooldown-aware GET helper
 		params = {
 			"mailto": self.mailto,
@@ -470,6 +486,7 @@ class OpenAlex:
 			self._meta[w_id] = w
 			out.append(w_id)
 
+		self._citers[ckey] = list(out)
 		return out
 
 	def search(self, query: str, k: int = 5) -> list[dict[str, Any]]:
@@ -493,6 +510,11 @@ class OpenAlex:
 		if not query.strip():
 			return []
 
+		# search-query cache, keyed by query + page size
+		skey = f"{query}:{k}"
+		if skey in self._search:
+			return self._search[skey]
+
 		params = {
 			"mailto": self.mailto,
 			"filter": f"title.search:{query}",
@@ -509,6 +531,7 @@ class OpenAlex:
 			w_id = w["id"].rsplit("/", 1)[-1].upper()
 			self._meta[w_id] = w
 
+		self._search[skey] = results
 		return results
 
 	def wid(self, pid: str) -> str:
@@ -622,6 +645,8 @@ class OpenAlex:
 		"""
 		self._cache.clear()
 		self._meta.clear()
+		self._citers.clear()
+		self._search.clear()
 
 	def close(self) -> None:
 		"""Persist the on-disk cache (if enabled), then close all managed sessions.
