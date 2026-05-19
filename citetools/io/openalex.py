@@ -9,10 +9,13 @@ Public surface: OpenAlex class with methods work, works, citers, search, wid,
 nbrs, clear, close.
 """
 
+import json
 import logging
+import os
 import threading
 import time
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -117,6 +120,8 @@ class OpenAlex:
 		sleep: float = 0.1,
 		timeout: float = 30.0,
 		citer_k: int = 50,
+		cache_path: str | None = None,
+		cache_flush_every: int = 200,
 		session: requests.Session | None = None,
 	) -> None:
 		"""Initialize OpenAlex client with polite-pool settings and thread-safe concurrency.
@@ -176,7 +181,48 @@ class OpenAlex:
 		self._cache: dict[str, dict[str, Any]] = {}
 		self._meta: dict[str, dict[str, Any]] = {}
 
+		# optional on-disk cache: persists _cache/_meta across runs so repeated
+		# fetches never re-hit openalex (cuts the 429 rate). disabled when
+		# cache_path is None -- then behavior is unchanged.
+		self._cache_path = Path(cache_path) if cache_path else None
+		self._flush_every = max(1, cache_flush_every)
+		self._cache_lock = threading.Lock()
+		self._gets_ok = 0
+		if self._cache_path is not None and self._cache_path.exists():
+			self._load_cache()
+
 		self.params = {"mailto": mailto}
+
+	def _load_cache(self) -> None:
+		"""Populate _cache/_meta from the on-disk cache file.
+
+		A malformed or unreadable file is ignored (start empty) with a warning;
+		a stale cache must never abort a run.
+		"""
+		try:
+			data = json.loads(self._cache_path.read_text())
+			self._cache = data.get("cache", {})
+			self._meta = data.get("meta", {})
+			log.info("loaded %d cached work(s) from %s", len(self._cache),
+			         self._cache_path)
+		except Exception as e:
+			log.warning("ignoring unreadable cache %s: %s", self._cache_path, e)
+
+	def _flush(self) -> None:
+		"""Atomically persist _cache/_meta to the on-disk cache file.
+
+		No-op when on-disk caching is off. Snapshots both dicts (a C-level
+		atomic copy, safe under concurrent fetches), writes a sibling temp file,
+		then os.replace() -- so a kill mid-write leaves the prior file intact,
+		never a corrupt one.
+		"""
+		if self._cache_path is None:
+			return
+		snapshot = {"cache": dict(self._cache), "meta": dict(self._meta)}
+		self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+		tmp = self._cache_path.with_suffix(self._cache_path.suffix + ".tmp")
+		tmp.write_text(json.dumps(snapshot))
+		os.replace(tmp, self._cache_path)
 
 	def _session(self) -> requests.Session:
 		"""Return the session for the current thread.
@@ -248,6 +294,16 @@ class OpenAlex:
 				raise OpenAlexError(f"failed to fetch {desc}: {e}") from e
 
 			self._limiter.relax()
+
+			# periodic on-disk cache flush so a killed run still persists most
+			# of its fetches; no-op when on-disk caching is disabled
+			if self._cache_path is not None:
+				with self._cache_lock:
+					self._gets_ok += 1
+					due = self._gets_ok % self._flush_every == 0
+				if due:
+					self._flush()
+
 			return data
 
 		raise OpenAlexError(
@@ -568,11 +624,12 @@ class OpenAlex:
 		self._meta.clear()
 
 	def close(self) -> None:
-		"""Close all managed sessions.
+		"""Persist the on-disk cache (if enabled), then close all managed sessions.
 
 		Test path: if session was injected, close it. Production path: close all
 		thread-local sessions registered in self._sessions. Idempotent.
 		"""
+		self._flush()
 		if self._injected_session is not None:
 			self._injected_session.close()
 		else:
