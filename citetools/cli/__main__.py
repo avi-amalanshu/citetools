@@ -58,6 +58,7 @@ class Config:
     - iters: (int >= 1, refine only)
     - strategy: "intersection" | "bidir" | "walk" | "refine"
     - verbose: bool
+    - cache: Optional[str], on-disk OpenAlex cache file path (None = off)
     - resolve_ids: Optional[list[str]], populated iff --resolve given
     - search_queries: Optional[list[str]], populated iff --search given
 
@@ -83,6 +84,7 @@ class Config:
     iters: int
     strategy: str
     verbose: bool
+    cache: Optional[str] = None
     resolve_ids: Optional[list[str]] = None
     search_queries: Optional[list[str]] = None
 
@@ -236,6 +238,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=3,
         help="refine: number of refinement rounds (each round runs the pairwise search; round 1 is the original groups) (default 3)",
     )
+    parser.add_argument(
+        "--cache",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="optional on-disk OpenAlex cache file; reused across runs so repeated fetches never re-hit the API (cuts the 429 rate). default: no disk cache",
+    )
 
     return parser
 
@@ -345,6 +354,7 @@ def _validate_config(args: argparse.Namespace) -> Config:
         iters=args.iters,
         strategy=args.strategy,
         verbose=args.verbose,
+        cache=args.cache,
         resolve_ids=resolve_ids,
         search_queries=search_queries,
     )
@@ -521,7 +531,7 @@ def _mode_resolve(cfg: Config) -> None:
     open OpenAlex client, iterate --resolve ids, call wid() + work(),
     print result, close client in finally.
     """
-    client = OpenAlex(mailto=cfg.mailto)
+    client = OpenAlex(mailto=cfg.mailto, cache_path=cfg.cache)
     try:
         for src in cfg.resolve_ids:
             try:
@@ -541,7 +551,7 @@ def _mode_search(cfg: Config) -> None:
     open OpenAlex client, iterate --search queries, call search(),
     print candidates, close client in finally.
     """
-    client = OpenAlex(mailto=cfg.mailto)
+    client = OpenAlex(mailto=cfg.mailto, cache_path=cfg.cache)
     try:
         for q in cfg.search_queries:
             print(f"search: {q}")
@@ -567,7 +577,7 @@ def _mode_main(cfg: Config) -> None:
     print, close client in finally. all exceptions propagate (let caller
     handle). strategy dispatch happens here.
     """
-    client = OpenAlex(mailto=cfg.mailto)
+    client = OpenAlex(mailto=cfg.mailto, cache_path=cfg.cache)
     try:
         results = _run_strategy(cfg, client)
         text = _format_results(cfg, results)
