@@ -25,7 +25,7 @@ Pick one with `--strategy` on the CLI, or call the matching function from the li
 `intersection` and `bidir` are interchangeable peers — same scoring, same
 dependencies. `walk` and `refine` are *cousins*, not drop-in siblings: both build on
 `bidir`'s search engine and add an optional local-embedding dependency, a semantic
-ranking, and randomised ensembling. `walk` does this in a single pass; `refine` runs
+ranking, and randomized ensembling. `walk` does this in a single pass; `refine` runs
 several re-seeding rounds on top. They are more experimental tools, each with its own
 philosophy (see [`walk`](#walk--semantic-ensemble) and
 [`refine`](#refine--iterative-path-bootstrap) below).
@@ -42,7 +42,7 @@ in its group graph, a hub indicator).
 ### `bidir` — bidirectional meet-in-the-middle
 
 A lazy search: instead of pre-growing a fixed-radius ball, it expands a frontier out
-from each group and stops where the frontiers meet. It never materialises more of the
+from each group and stops where the frontiers meet. It never materializes more of the
 graph than it needs. Two modes:
 
 - **`budget`** (default): caps each frontier to `--frontier-cap` papers per step
@@ -193,7 +193,7 @@ python -m citetools --mailto you@example.com --strategy bidir --mode exact \
 python -m citetools --mailto you@example.com --strategy walk \
     --group W2626778328 --group W2519887557 --depth 4 --cap 120
 
-# walk with a randomised ensemble
+# walk with a randomized ensemble
 python -m citetools --mailto you@example.com --strategy walk --ensemble -M 5 \
     --group W2626778328 --group W2519887557 --depth 4
 
@@ -223,7 +223,7 @@ the graph-convolutional-networks paper (`W2519887557`), and prints, among others
 | `--frontier-cap` | `bidir` budget-mode per-step frontier cap, *per pairwise engine* — a *blunt* compute-budget guard; ignored in exact mode and by other strategies | 50 |
 | `--cap` | `walk`/`refine` per-step per-engine frontier cap — the *smart*, embedding-steered analogue of `--frontier-cap` (see [below](#--frontier-cap-vs---cap)); ignored by other strategies | 60 |
 | `--iters` | `refine`: number of re-seeding rounds; ignored by other strategies | 3 |
-| `--ensemble` | `walk`/`refine`: run a randomised ensemble instead of one deterministic pass | off |
+| `--ensemble` | `walk`/`refine`: run a randomized ensemble instead of one deterministic pass | off |
 | `-M`, `--ensemble-runs` | `walk`/`refine`: ensemble run count (used with `--ensemble`) | 5 |
 | `-p`, `--floor-prob` | `walk`/`refine`: floor keep-probability in stochastic pruning | 0.15 |
 | `-T`, `--temperature` | `walk`/`refine`: pruning-sigmoid temperature | 0.1 |
