@@ -21,16 +21,18 @@ inspect, not ground truth. see [limitations](#limitations).
 ## Strategies
 
 citetools ships two interchangeable *core* strategies — `intersection` and `bidir` —
-plus `walk`, a **cousin** of `bidir`. All take the same input (N groups of seed
-papers) and return a ranked list of bridge papers; they differ in *how* they walk the
-citation graph, and `walk` also differs in *how it ranks*. Pick one with `--strategy`
-on the CLI, or call the matching function from the library.
+plus two experimental **cousins**, `walk` and `refine`. All take the same input (N
+groups of seed papers) and return a ranked list of bridge papers; they differ in
+*how* they walk the citation graph, and the cousins also differ in *how they rank*.
+Pick one with `--strategy` on the CLI, or call the matching function from the library.
 
 `intersection` and `bidir` are interchangeable peers — same scoring, same
-dependencies. `walk` is a *cousin*, not a drop-in sibling: it is built on top of
-`bidir`'s search engine, but adds an optional local-embedding dependency, a semantic
-ranking, and randomised ensembling. A more experimental tool, with its own
-philosophy (see [`walk`](#walk--semantic-ensemble) below).
+dependencies. `walk` and `refine` are *cousins*, not drop-in siblings: both build on
+`bidir`'s search engine and add an optional local-embedding dependency, a semantic
+ranking, and randomised ensembling. `walk` does this in a single pass; `refine` runs
+several re-seeding rounds on top. They are more experimental tools, each with its own
+philosophy (see [`walk`](#walk--semantic-ensemble) and
+[`refine`](#refine--iterative-path-bootstrap) below).
 
 ### `intersection` — exhaustive
 
@@ -86,6 +88,30 @@ is **experimental**: on closely-related groups it surfaces sensible bridges, but
 very distant groups a thin steered frontier can still miss a path (raise `--cap`, or
 use `--ensemble`). Treat its output as a hypothesis, more so than the other two.
 
+### `refine` — iterative path bootstrap
+
+The most experimental strategy, and a **cousin of `walk`** (so, of `bidir`): where the
+others find bridges in a single pass, `refine` runs several rounds and *re-seeds*
+between them. It needs **N >= 3** groups.
+
+Each round it runs `walk`-style embedding-steered searches between the current groups,
+reconstructs the *paths* — the chains of papers — along which pairs met, and relaxes a
+running table of best-known per-group distances. It then takes the papers lying on
+those paths whose titles are most semantically similar to the groups still poorly
+covered, and uses them as the refined seeds for the next round. So the search
+bootstraps a connecting structure: each round walks a little further along the most
+promising discovered paths, steered toward the areas not yet linked. It stops once
+every group is reached, or after `--iters` rounds.
+
+`refine` reuses `walk`'s engine and ensemble machinery, so it takes the same `--cap`,
+`--ensemble` / `-M` / `-p` / `-T` and `--seed` knobs, plus `--iters` (round count).
+Like `walk` it needs the optional embedding dependency and keeps all paper data
+on-machine; results carry the usual fields plus `recurrence`.
+
+Reach for `refine` when N >= 3 areas do not connect in a single pass and you want the
+search to *iteratively* hunt a path rather than grow a fixed-radius ball — but it is
+the least predictable of the four. Treat its output as a hypothesis first of all.
+
 ### which to use
 
 | you want... | use |
@@ -97,9 +123,10 @@ use `--ensemble`). Treat its output as a hypothesis, more so than the other two.
 | N>=3 quick exploration | `bidir` (budget) |
 | a deeper search steered toward a bridge, ranked by conceptual similarity | `walk` |
 | robustness on a hard case — re-roll the steered search | `walk --ensemble` |
+| N>=3 areas that don't connect in one pass — iteratively hunt a path | `refine` |
 
-`intersection` is the default strategy. `walk` requires the optional embedding
-dependency.
+`intersection` is the default strategy. `walk` and `refine` require the optional
+embedding dependency; `refine` needs N>=3 groups.
 
 ## Scoring
 
@@ -173,6 +200,11 @@ python -m citetools --mailto you@example.com --strategy walk \
 # walk with a randomised ensemble
 python -m citetools --mailto you@example.com --strategy walk --ensemble -M 5 \
     --group W2626778328 --group W2519887557 --depth 4
+
+# refine: iterative multi-round bootstrap (N>=3; needs requirements-walk.txt)
+python -m citetools --mailto you@example.com --strategy refine \
+    --group W2626778328 --group W2519887557 --group W3177828909 \
+    --depth 2 --iters 3
 ```
 
 `--group` is repeated once per research area; each takes comma-separated seed ids
@@ -190,18 +222,19 @@ the graph-convolutional-networks paper (`W2519887557`), and prints, among others
 | flag | meaning | default |
 |---|---|---|
 | `--mailto` | email for the OpenAlex polite pool (required) | : |
-| `--strategy` | `intersection`, `bidir`, or `walk` | `intersection` |
+| `--strategy` | `intersection`, `bidir`, `walk`, or `refine` | `intersection` |
 | `--mode` | `budget` or `exact`; applies to `bidir` only, ignored otherwise | `budget` |
 | `--frontier-cap` | `bidir` budget-mode per-step frontier cap, *per pairwise engine* — a *blunt* compute-budget guard; ignored in exact mode and by other strategies | 50 |
-| `--cap` | `walk` per-step per-engine frontier cap — the *smart*, embedding-steered analogue of `--frontier-cap` (see [below](#--frontier-cap-vs---cap)); ignored by other strategies | 60 |
-| `--ensemble` | `walk`: run a randomised ensemble instead of one deterministic pass | off |
-| `-M`, `--ensemble-runs` | `walk`: ensemble run count (used with `--ensemble`) | 5 |
-| `-p`, `--floor-prob` | `walk`: floor keep-probability in stochastic pruning | 0.15 |
-| `-T`, `--temperature` | `walk`: pruning-sigmoid temperature | 0.1 |
+| `--cap` | `walk`/`refine` per-step per-engine frontier cap — the *smart*, embedding-steered analogue of `--frontier-cap` (see [below](#--frontier-cap-vs---cap)); ignored by other strategies | 60 |
+| `--iters` | `refine`: number of re-seeding rounds; ignored by other strategies | 3 |
+| `--ensemble` | `walk`/`refine`: run a randomised ensemble instead of one deterministic pass | off |
+| `-M`, `--ensemble-runs` | `walk`/`refine`: ensemble run count (used with `--ensemble`) | 5 |
+| `-p`, `--floor-prob` | `walk`/`refine`: floor keep-probability in stochastic pruning | 0.15 |
+| `-T`, `--temperature` | `walk`/`refine`: pruning-sigmoid temperature | 0.1 |
 | `--alpha` | `walk`: structural-vs-embedding fusion weight (1.0 = pure structural) | 0.7 |
-| `--seed` | `walk`: RNG seed for a reproducible ensemble | unseeded |
+| `--seed` | `walk`/`refine`: RNG seed for a reproducible ensemble | unseeded |
 | `--group` | one research area; comma-separated seed ids; repeat per area | demo set |
-| `--depth` | citation hops expanded (per seed for `intersection`, per side for `bidir`/`walk`) | 2 |
+| `--depth` | citation hops expanded (per seed for `intersection`, per side for `bidir`/`walk`/`refine`) | 2 |
 | `--top-k` | number of bridges to return | 25 |
 | `--min-groups` | how many groups a candidate must reach to qualify | all groups |
 | `--n-jobs` | worker threads for concurrent fetching; 1 = serial | 8 |
@@ -356,15 +389,15 @@ and exit, never touching the finder (no `--group` needed). If both are passed,
 
 ```python
 from citetools import (
-    OpenAlex, CiteGraph,
+    OpenAlex,
     find_bridges,             # intersection
     find_bridges_bidir,       # bidir, N=2
     find_bridges_bidir_nway,  # bidir, N>=3
     find_bridges_walk,        # walk
 )
 
-client = OpenAlex(mailto="you@example.com")
-oracle = CiteGraph(client)
+# the OpenAlex client is the oracle the strategies take directly
+oracle = OpenAlex(mailto="you@example.com")
 
 # intersection, any N
 a = find_bridges(oracle, [["W2626778328"], ["W2519887557"]], depth=2)
@@ -395,36 +428,46 @@ field).
 
 ## How it works
 
-Layered modules:
+The codebase is split into a pure core and a single impure i/o shell: every search
+engine is a deterministic pure generator, and one runtime is the only thing that
+performs i/o.
 
-- **`citetools/openalex.py`** — L1, the `OpenAlex` client. A thin, cached wrapper over
-  the OpenAlex REST API: id normalisation, single + batched work fetches, and
-  incoming-citation lookups. Holds a shared rate limiter (keeps the aggregate request
-  rate under the ~10 req/s polite-pool ceiling) and a per-thread HTTP session, so it
-  is safe under concurrent fetches.
-- **`citetools/parallel.py`** — L1.5, the concurrent fetch helper (`fetch_all`):
-  fetches many nodes' neighbour lists in parallel over a thread pool.
-- **`citetools/graph.py`** — L2, the `CiteGraph` lazy oracle. Exposes `nbrs(node)`
-  (lazy, cached neighbour lists) and `grow(seed, depth)` (a breadth-first citation
-  neighbourhood as a `networkx` graph). The shared substrate for every strategy.
-- **`citetools/strategies/`** — L3, the pluggable strategies:
-  - `intersection.py` — `find_bridges`: grows a neighbourhood per group, scores every
-    non-seed node by summed shortest-path distance (one multi-source BFS per group),
-    keeps the nodes reaching enough groups, ranks them.
-  - `bidir.py` — `find_bridges_bidir` / `find_bridges_bidir_nway`: a pure-CPU
-    bidirectional search engine plus two aggregators. The engine is a step state
-    machine — it asks the aggregator for a frontier's neighbours and advances; the
-    aggregator owns all I/O. N>=3 round-robins one engine per group pair.
-  - `walk.py` — `find_bridges_walk`: a cousin of `bidir`. It reuses `bidir`'s engine
-    (uncapped — `frontier_cap=None`), and instead prunes each step's frontier itself,
-    keeping the papers most embedding-similar to the partner group; optionally
-    ensembles and fuses the score. Depends on the optional `citetools/embed.py`.
-- **`citetools/embed.py`** — L1.5 (optional), the local title-embedding layer
-  (`TitleEmbedder`): a lazily-loaded sentence-transformer, used only by `walk`.
+- **`citetools/io/`** — the impure shell, the only place effects and mutable caches
+  live:
+  - `openalex.py` — the `OpenAlex` client: a cached wrapper over the OpenAlex REST
+    API (id normalisation, single + batched work fetches, incoming-citation lookups,
+    and `nbrs(node)` neighbour lists). Holds a shared rate limiter (keeps the
+    aggregate request rate under the ~10 req/s polite-pool ceiling) and per-thread
+    HTTP sessions, so it is safe under concurrent fetches.
+  - `parallel.py` — the concurrent fetch helper (`fetch_all`): fetches many nodes'
+    neighbour lists in parallel over a thread pool.
+  - `models.py` — the optional local title-embedding model loader and cache, used
+    only by `walk`.
+  - `runtime.py` — the interpreter that drives the pure engines, performing all
+    fetching and embedding: `run` for one engine, the lockstep-union `run_ensemble`
+    for many.
+- **`citetools/core/`** — the pure core: no i/o, no mutation of inputs.
+  - `parse.py` — id canonicalisation and OpenAlex-json shaping.
+  - `score.py` — distance aggregation, ranking, and result-record shaping, shared by
+    every strategy.
+  - `embed.py` — pure embedding math (cosine similarity).
+  - `engines/` — the search strategies as pure Python generators over a shared
+    `protocol.py` (`Req` / `Resp` / `SearchResult`). An engine `yield`s the batch of
+    nodes it needs and receives their neighbours back; it performs no i/o and keeps
+    no state outside its own frame. `bidir.py` is the meet-in-the-middle engine;
+    `walk.py` and `refine.py` build on it; `intersection.py` is the exhaustive N-way
+    engine.
+- **`citetools/strategies.py`** — the public `find_bridges*` functions: thin impure
+  wrappers that build the right engine(s), drive them through the runtime, and shape
+  the result via `core.score`.
+- **`citetools/cli/`** — the command-line interface.
+
+This "pure modulo i/o" split makes the engines deterministic and offline-testable:
+given the same seeds and the same sequence of fetched neighbours, an engine emits the
+same requests and the same result.
 
 Supporting files: `citetools/errors.py` (`OpenAlexError` / `BadId`),
-`citetools/strategies/__init__.py` and `citetools/__init__.py` (the public API),
-`citetools/__main__.py` (the CLI).
+`citetools/__init__.py` (the public API), `citetools/__main__.py` (the CLI shim).
 
 ## Concurrency
 
@@ -433,12 +476,13 @@ step: that step's frontier nodes have their neighbour lists fetched concurrently
 a thread pool (`--n-jobs`, default 8). The steps themselves stay sequential — each one
 needs the previous step's results.
 
-**Ensemble runs in parallel (`walk`).** `walk --ensemble` adds a second axis of
-concurrency: its `M` stochastic runs are independent, so each is driven on its own
-thread. The `--n-jobs` budget is split across them — `max(1, n_jobs // M)` I/O threads
-per run — keeping the total near `--n-jobs`. The runs share one OpenAlex client, hence
-one cache (a paper fetched by one run is free for the rest) and one rate limiter. A
-single `walk` run (no `--ensemble`) is unaffected: one run, the full `--n-jobs`.
+**Ensemble runs, lockstep-batched (`walk`).** `walk --ensemble` runs `M` independent
+stochastic runs. The runtime drives them in lockstep: each round it unions every live
+run's frontier into one concurrent fetch over the full `--n-jobs` pool, then hands
+each run its slice. So all `M` runs share one thread pool (no `n_jobs // M` split),
+one OpenAlex cache (a paper fetched for one run is free for the rest), and one rate
+limiter — and a node needed by several runs in the same round is fetched once. A
+single `walk` run (no `--ensemble`) is the same machinery driving one run.
 
 **Shared rate limiter.** One rate limiter, shared across every thread — and, for
 `walk`, every run — holds the aggregate request rate within the OpenAlex polite pool's
